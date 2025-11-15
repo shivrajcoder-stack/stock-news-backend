@@ -1,5 +1,4 @@
 from fastapi import FastAPI, APIRouter, Query
-from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
 from starlette.middleware.cors import CORSMiddleware
 import os
@@ -14,45 +13,38 @@ import random
 from urllib.parse import quote
 import PyPDF2
 
-
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
-# Create the main app without a prefix
 app = FastAPI()
-
-# Create a router with the /api prefix
 api_router = APIRouter(prefix="/api")
 
-# Configure logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-# ============================================================================  
-# GLOBAL DATA STRUCTURES  
-# ============================================================================  
+# ==============================
+# GLOBAL DATA
+# ==============================
 COMPANY_NAMES: List[str] = []
 NEWS_CACHE: Dict[str, Dict] = {}  # {company_name: {news: [...], timestamp: ...}}
 CACHE_DURATION = 15 * 60  # 15 minutes
 
-# Impact keywords for ALL section
 IMPACT_KEYWORDS = [
     "profit", "loss", "acquisition", "merger", "deal", "insider",
     "earnings", "quarterly results", "fraud", "FDI", "investment",
     "SEBI", "revenue", "scam"
 ]
 
-# Sector keywords
 FMCG_KEYWORDS = ["FMCG", "consumer goods", "food", "beverages", "retail", "packaged foods"]
 HEALTH_KEYWORDS = ["pharma", "drug", "hospital", "healthcare", "biotech", "vaccine"]
 
 
-# ============================================================================  
-# PDF PARSING - Extract Company Names  
-# ============================================================================  
+# ==============================
+# LOAD COMPANY LIST FROM PDF
+# ==============================
 def load_company_names():
     global COMPANY_NAMES
     pdf_path = ROOT_DIR / 'company_list.pdf'
@@ -68,8 +60,8 @@ def load_company_names():
             for page in pdf_reader.pages:
                 text += page.extract_text()
             
-            lines = text.split('\n')
             companies = []
+            lines = text.split('\n')
             for line in lines:
                 line = line.strip()
                 if line and ('Limited' in line or 'Ltd' in line or 'ETF' in line):
@@ -77,223 +69,193 @@ def load_company_names():
             
             seen = set()
             COMPANY_NAMES = [x for x in companies if not (x in seen or seen.add(x))]
-            logger.info(f"Loaded {len(COMPANY_NAMES)} company names from PDF")
+            logger.info(f"Loaded {len(COMPANY_NAMES)} companies")
     except Exception as e:
         logger.error(f"Error loading company names: {e}")
 
 
-# ============================================================================  
-# RSS FETCHING LOGIC  
-# ============================================================================  
+# ==============================
+# GOOGLE NEWS FETCH
+# ==============================
 async def fetch_company_news(company_name: str) -> List[Dict]:
     try:
-        query = f"{company_name} stock"
-        url = f"https://news.google.com/rss/search?q={quote(query)}"
+        url = f"https://news.google.com/rss/search?q={quote(company_name + ' stock')}"
         feed = await asyncio.to_thread(feedparser.parse, url)
-        
-        news_items = []
+
+        news = []
         for entry in feed.entries[:5]:
-            news_items.append({
-                'title': entry.get('title', ''),
-                'link': entry.get('link', ''),
-                'pubDate': entry.get('published', ''),
-                'description': entry.get('summary', '')
+            news.append({
+                "title": entry.get("title", ""),
+                "link": entry.get("link", ""),
+                "pubDate": entry.get("published", ""),
+                "description": entry.get("summary", "")
             })
-        
-        return news_items
+        return news
     except Exception as e:
         logger.error(f"Error fetching news for {company_name}: {e}")
         return []
 
 
-def is_cache_valid(company_name: str) -> bool:
-    if company_name not in NEWS_CACHE:
-        return False
-    
-    cache_time = NEWS_CACHE[company_name].get('timestamp', 0)
-    return (time.time() - cache_time) < CACHE_DURATION
-
-
-# ============================================================================  
-# FIXED FUNCTION — ALWAYS CACHES RESULTS  
-# ============================================================================  
+# ==============================
+# NEW LOGIC — CACHE ALWAYS, NEVER FETCH ON USER REQUEST
+# ==============================
 async def get_company_news_cached(company_name: str) -> List[Dict]:
-    """Get company news with caching that ALWAYS stores results."""
-    
-    # Return cached data if valid
-    if is_cache_valid(company_name):
-        return NEWS_CACHE[company_name]['news']
-    
-    # Fetch fresh news
-    news = await fetch_company_news(company_name)
+    """
+    NEW LOGIC:
+    ✔ NEVER fetch when user searches
+    ✔ ALWAYS return cached result instantly
+    ✔ If not cached yet → return empty list
+    """
+    if company_name in NEWS_CACHE:
+        return NEWS_CACHE[company_name]["news"]
 
-    # ALWAYS cache (even empty lists)
-    NEWS_CACHE[company_name] = {
-        'news': news,
-        'timestamp': time.time()
-    }
-
-    return news
+    return []  # no fetching on user request
 
 
-# ============================================================================  
-# BACKGROUND BATCH UPDATER  
-# ============================================================================  
+# ==============================
+# BACKGROUND UPDATER (FETCHES EVERYTHING)
+# ==============================
 async def update_batch(companies: List[str]):
     semaphore = asyncio.Semaphore(10)
-    
-    async def fetch_with_limit(company):
+
+    async def fetch_with_limit(name):
         async with semaphore:
-            return await get_company_news_cached(company)
-    
-    tasks = [fetch_with_limit(company) for company in companies]
+            news = await fetch_company_news(name)
+            NEWS_CACHE[name] = {
+                "news": news,
+                "timestamp": time.time()
+            }
+
+    tasks = [fetch_with_limit(c) for c in companies]
     await asyncio.gather(*tasks, return_exceptions=True)
 
 
 async def background_news_updater():
-    logger.info("Starting background news updater...")
-    
+    logger.info("Background updater started")
+
     while True:
         try:
             total = len(COMPANY_NAMES)
             batch_size = 100
-            
+
             for i in range(0, total, batch_size):
-                batch = COMPANY_NAMES[i:i + batch_size]
+                batch = COMPANY_NAMES[i:i+batch_size]
                 await update_batch(batch)
                 await asyncio.sleep(random.uniform(0.5, 1.5))
-            
-            logger.info(f"Cached news for {len(NEWS_CACHE)} companies.")
+
+            logger.info(f"Updated cache for {len(NEWS_CACHE)} companies")
             await asyncio.sleep(15 * 60)
-        
+
         except Exception as e:
-            logger.error(f"Background updater error: {e}")
+            logger.error(f"Updater error: {e}")
             await asyncio.sleep(60)
 
 
-# ============================================================================  
-# FILTERING  
-# ============================================================================  
+# ==============================
+# FILTERING FUNCTIONS
+# ==============================
 def has_keywords(text: str, keywords: List[str]) -> bool:
-    text_lower = text.lower()
-    return any(keyword.lower() in text_lower for keyword in keywords)
+    text = text.lower()
+    return any(k.lower() in text for k in keywords)
 
 
-def filter_impactful_news(all_news: List[Dict]) -> List[Dict]:
+def filter_impactful_news(all_news: List[Dict]):
     impactful = []
-    
     for item in all_news:
-        text = item['title'] + ' ' + item.get('description', '')
+        text = item["title"] + " " + item.get("description", "")
         if has_keywords(text, IMPACT_KEYWORDS):
             impactful.append(item)
-    
     return impactful[:30]
 
 
-def filter_sector_news(all_news: List[Dict], keywords: List[str]) -> List[Dict]:
-    sector_news = []
-    
+def filter_sector_news(all_news: List[Dict], keywords: List[str]):
+    result = []
     for item in all_news:
-        text = item['title'] + ' ' + item.get('description', '')
-        if has_keywords(text, keywords):
-            sector_news.append(item)
-    
-    return sector_news[:150]
+        if has_keywords(item["title"] + " " + item.get("description", ""), keywords):
+            result.append(item)
+    return result[:150]
 
 
-# ============================================================================  
-# API ENDPOINTS  
-# ============================================================================  
+# ==============================
+# API ENDPOINTS
+# ==============================
 @api_router.get("/companies/search")
 async def search_companies(q: str = Query("", description="Search query")):
     if not q:
         return []
-    
     q = q.lower()
-    matches = [name for name in COMPANY_NAMES if name.lower().startswith(q)]
-    return matches[:50]
+    return [n for n in COMPANY_NAMES if n.lower().startswith(q)][:50]
 
 
 @api_router.get("/news/company/{company_name}")
-async def get_news_by_company(company_name: str):
+async def get_company_news(company_name: str):
     news = await get_company_news_cached(company_name)
-    return {'company': company_name, 'news': news}
+    return {"company": company_name, "news": news}
 
 
 @api_router.get("/news/all")
-async def get_all_impactful_news():
+async def get_all_news():
     all_news = []
-    
-    for company, cache_data in NEWS_CACHE.items():
-        for item in cache_data.get('news', []):
+    for company, cache in NEWS_CACHE.items():
+        for item in cache["news"]:
             x = item.copy()
-            x['company'] = company
+            x["company"] = company
             all_news.append(x)
-    
-    impactful = filter_impactful_news(all_news)
-    return {'news': impactful, 'count': len(impactful)}
+    return {"news": filter_impactful_news(all_news)}
 
 
 @api_router.get("/news/sector/fmcg")
 async def get_fmcg_news():
     all_news = []
-    for company, cache_data in NEWS_CACHE.items():
-        for item in cache_data.get('news', []):
+    for company, cache in NEWS_CACHE.items():
+        for item in cache["news"]:
             x = item.copy()
-            x['company'] = company
+            x["company"] = company
             all_news.append(x)
-    
-    sector = filter_sector_news(all_news, FMCG_KEYWORDS)
-    return {'news': sector, 'count': len(sector)}
+    return {"news": filter_sector_news(all_news, FMCG_KEYWORDS)}
 
 
 @api_router.get("/news/sector/health")
 async def get_health_news():
     all_news = []
-    for company, cache_data in NEWS_CACHE.items():
-        for item in cache_data.get('news', []):
+    for company, cache in NEWS_CACHE.items():
+        for item in cache["news"]:
             x = item.copy()
-            x['company'] = company
+            x["company"] = company
             all_news.append(x)
-    
-    sector = filter_sector_news(all_news, HEALTH_KEYWORDS)
-    return {'news': sector, 'count': len(sector)}
+    return {"news": filter_sector_news(all_news, HEALTH_KEYWORDS)}
 
 
 @api_router.get("/status")
 async def get_status():
     return {
-        'companies_loaded': len(COMPANY_NAMES),
-        'companies_cached': len(NEWS_CACHE),
-        'cache_duration_minutes': CACHE_DURATION / 60
+        "companies_loaded": len(COMPANY_NAMES),
+        "companies_cached": len(NEWS_CACHE),
+        "cache_duration_minutes": CACHE_DURATION / 60,
     }
 
 
-# ============================================================================  
-# APP SETUP  
-# ============================================================================  
+# ==============================
+# STARTUP
+# ==============================
 app.include_router(api_router)
 
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
-    allow_origins=os.environ.get('CORS_ORIGINS', '*').split(','),
+    allow_origins=os.environ.get("CORS_ORIGINS", "*").split(","),
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-
-# ============================================================================  
-# STARTUP  
-# ============================================================================  
 @app.on_event("startup")
-async def startup_event():
-    logger.info("Starting app...")
+async def startup():
+    logger.info("Loading company names...")
     load_company_names()
     asyncio.create_task(background_news_updater())
     logger.info("Startup complete")
 
 
 @app.on_event("shutdown")
-async def shutdown_event():
+async def shutdown():
     logger.info("Shutting down...")
