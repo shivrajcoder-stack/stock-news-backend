@@ -5,7 +5,377 @@ import time
 import random
 import asyncio
 import logging
+import re# server.py  (FINAL – PDF ONLY, NO SYMBOL LOGIC, FIXED ENDPOINTS)
+
+import json
+import time
+import random
+import asyncio
+import logging
 import re
+import feedparser
+import PyPDF2
+
+from fastapi import FastAPI, APIRouter, Query
+from starlette.middleware.cors import CORSMiddleware
+from pathlib import Path
+from urllib.parse import quote
+from typing import Dict, List, Optional
+
+app = FastAPI()
+api = APIRouter(prefix="/api")
+
+ROOT = Path(__file__).parent
+CACHE_FILE = ROOT / "news_cache.json"
+COMPANY_PDF = ROOT / "company_list.pdf"
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("server")
+
+# -----------------------------
+# CONFIG
+# -----------------------------
+CACHE_DURATION = 15 * 60
+BATCH_SIZE = 100
+SEMAPHORE_LIMIT = 10
+SAVE_INTERVAL_SECONDS = 60
+
+# -----------------------------
+# GLOBAL STATE
+# -----------------------------
+COMPANY_NAMES: List[str] = []
+NEWS_CACHE: Dict[str, Dict] = {}
+
+# -----------------------------
+# TOP STOCKS + SECTORS
+# -----------------------------
+TOP_STOCKS = [
+    "Reliance Industries Limited", "Tata Consultancy Services Limited",
+    "HDFC Bank Limited", "ICICI Bank Limited", "Infosys Limited",
+    "Hindustan Unilever Limited", "State Bank of India", "Larsen & Toubro Limited",
+    "Bharti Airtel Limited", "ITC Limited", "Tata Motors Limited",
+    "Kotak Mahindra Bank Limited", "Axis Bank Limited", "Maruti Suzuki India Limited",
+    "Bajaj Finance Limited", "Mahindra & Mahindra Limited", "Wipro Limited",
+    "Power Grid Corporation of India Limited", "Asian Paints Limited",
+    "HCL Technologies Limited"
+]
+
+PENNY_STOCKS = [
+    "Tilaknagar Industries Limited", "3i Infotech Limited", "XYZ Penny Ltd"
+]
+
+SECTOR_KEYWORDS = {
+    "FMCG": ["fmcg", "consumer", "beverage", "retail"],
+    "IT": ["it", "tech", "software", "digital", "tcs", "infosys"],
+    "BANKING": ["bank", "banking", "hdfc", "icici", "sbi"],
+    "AUTO": ["auto", "vehicle", "motors", "maruti"],
+    "ENERGY": ["oil", "gas", "energy", "petro"],
+    "PSU": ["psu", "public sector"],
+    "TELECOM": ["telecom", "airtel", "jio", "vodafone"],
+    "MIDCAP": ["midcap"],
+    "SMALLCAP": ["smallcap"],
+    "LARGECAP": ["largecap"]
+}
+
+GOOD_WORDS = ["profit", "growth", "surge", "beats", "upgrade", "wins"]
+BAD_WORDS = ["loss", "fraud", "crash", "decline", "fall", "slump"]
+IMPACT_WORDS = GOOD_WORDS + BAD_WORDS + ["earnings", "results", "revenue"]
+
+# -----------------------------
+# HELPERS
+# -----------------------------
+def clean_html(text: str) -> str:
+    text = re.sub(r"<[^>]+>", "", text or "")
+    return re.sub(r"\s+", " ", text).strip()
+
+def detect_sentiment(text: str) -> str:
+    t = text.lower()
+    if any(w in t for w in GOOD_WORDS): return "good"
+    if any(w in t for w in BAD_WORDS): return "bad"
+    return "neutral"
+
+def remove_duplicates(lst):
+    seen, out = set(), []
+    for x in lst:
+        key = (x.get("title","").lower(), x.get("link","").lower())
+        if key not in seen:
+            seen.add(key)
+            out.append(x)
+    return out
+
+def extract_facts(text: str):
+    facts = {}
+    if not text: return facts
+
+    # Revenue
+    m = re.search(r"(revenue|sales)[^\d]{0,10}([\d,]+\.?\d*)", text, re.I)
+    if m: facts["revenue"] = m.group(2)
+
+    # Profit
+    m = re.search(r"(profit|PAT|income)[^\d]{0,10}([\d,]+\.?\d*)", text, re.I)
+    if m: facts["net_profit"] = m.group(2)
+
+    # EPS
+    m = re.search(r"EPS[^\d]{0,10}([\d\.]+)", text, re.I)
+    if m: facts["eps"] = m.group(1)
+
+    # Dividend
+    m = re.search(r"dividend[^\d]{0,10}([\d\.]+)", text, re.I)
+    if m: facts["dividend"] = m.group(1)
+
+    return facts
+
+def is_results_news(text: str):
+    t = text.lower()
+    return any(x in t for x in ["q1", "q2", "q3", "q4", "quarter", "results", "eps", "profit", "revenue"])
+
+# -----------------------------
+# LOAD COMPANIES (PDF ONLY)
+# -----------------------------
+def load_company_names():
+    global COMPANY_NAMES
+    if not COMPANY_PDF.exists():
+        logger.error("PDF not found")
+        return
+
+    pdf = PyPDF2.PdfReader(open(COMPANY_PDF, "rb"))
+    txt = "".join([page.extract_text() or "" for page in pdf.pages])
+    names = []
+
+    for line in txt.split("\n"):
+        line = line.strip()
+        if "Limited" in line or "Ltd" in line:
+            names.append(line)
+
+    COMPANY_NAMES = sorted(set(names))
+    logger.info(f"Loaded {len(COMPANY_NAMES)} companies (PDF only)")
+
+# -----------------------------
+# LOAD CACHE
+# -----------------------------
+def load_cache():
+    global NEWS_CACHE
+    if CACHE_FILE.exists():
+        NEWS_CACHE = json.load(open(CACHE_FILE))
+        logger.info(f"Loaded cache: {len(NEWS_CACHE)}")
+
+async def periodic_save():
+    while True:
+        json.dump(NEWS_CACHE, open(CACHE_FILE, "w"))
+        await asyncio.sleep(SAVE_INTERVAL_SECONDS)
+
+# -----------------------------
+# FETCH NEWS
+# -----------------------------
+async def fetch_company_news(name):
+    try:
+        q = quote(name + " stock")
+        url = f"https://news.google.com/rss/search?q={q}"
+
+        feed = await asyncio.to_thread(feedparser.parse, url)
+        out = []
+
+        for e in feed.entries[:8]:
+            t = clean_html(e.get("title",""))
+            d = clean_html(e.get("summary","") or e.get("description",""))
+            link = e.get("link","")
+            pub = e.get("published","") or e.get("updated","")
+
+            combined = (t + " " + d).strip()
+            facts = extract_facts(combined)
+
+            out.append({
+                "title": t,
+                "description": d,
+                "link": link,
+                "pubDate": pub,
+                "sentiment": detect_sentiment(combined),
+                "summary": generate_summary(t, d, facts),
+                "facts": facts
+            })
+
+        return remove_duplicates(out)[:5]
+    except:
+        return []
+
+# -----------------------------
+# SUMMARY GEN
+# -----------------------------
+def generate_summary(title, desc, facts):
+    if facts:
+        parts = []
+        if "revenue" in facts: parts.append("Revenue " + facts["revenue"])
+        if "net_profit" in facts: parts.append("Profit " + facts["net_profit"])
+        if "eps" in facts: parts.append("EPS " + facts["eps"])
+        if "dividend" in facts: parts.append("Dividend " + facts["dividend"])
+        return " • ".join(parts)
+
+    if desc:
+        if len(desc) > 140:
+            return desc[:137] + "..."
+        return desc
+
+    if title:
+        return title[:140]
+
+    return ""
+
+# -----------------------------
+# UPDATE ONE COMPANY
+# -----------------------------
+async def update_one_company(name):
+    news = await fetch_company_news(name)
+    if news:
+        NEWS_CACHE[name] = {"news": news, "timestamp": time.time()}
+
+# -----------------------------
+# BATCH UPDATE
+# -----------------------------
+async def update_batch(batch):
+    sem = asyncio.Semaphore(SEMAPHORE_LIMIT)
+
+    async def worker(name):
+        async with sem:
+            await update_one_company(name)
+
+    await asyncio.gather(*[worker(c) for c in batch])
+
+# -----------------------------
+# BACKGROUND UPDATER LOOP
+# -----------------------------
+async def updater_loop():
+    while True:
+        total = len(COMPANY_NAMES)
+        for i in range(0, total, BATCH_SIZE):
+            batch = COMPANY_NAMES[i:i+BATCH_SIZE]
+            await update_batch(batch)
+            await asyncio.sleep(random.uniform(0.5, 1.2))
+
+        await asyncio.sleep(CACHE_DURATION)
+
+# -----------------------------
+# BUILDERS
+# -----------------------------
+def filter_last_7_days(items):
+    out = []
+    now = time.time()
+
+    for x in items:
+        try:
+            d = time.mktime(time.strptime(x.get("pubDate","")[:25], "%a, %d %b %Y %H:%M:%S"))
+            if now - d <= 7*86400:
+                out.append(x)
+        except:
+            out.append(x)
+
+    return out
+
+def build_all():
+    out = []
+    for c, v in NEWS_CACHE.items():
+        for n in v.get("news", []):
+            item = n.copy()
+            item["company"] = c
+            out.append(item)
+
+    out = filter_last_7_days(out)
+    out.sort(key=lambda x: x.get("pubDate",""), reverse=True)
+    return out[:150]
+
+def build_results():
+    out = []
+    for c, v in NEWS_CACHE.items():
+        for n in v.get("news", []):
+            if is_results_news(n["title"] + " " + n["description"]):
+                item = n.copy()
+                item["company"] = c
+                out.append(item)
+    out = filter_last_7_days(out)
+    out.sort(key=lambda x: x.get("pubDate",""), reverse=True)
+    return out[:150]
+
+def build_sector(keywords):
+    out = []
+    keys = [k.lower() for k in keywords]
+
+    for c, v in NEWS_CACHE.items():
+        for n in v.get("news", []):
+            t = (n["title"] + " " + n["description"]).lower()
+            if any(k in t for k in keys):
+                item = n.copy()
+                item["company"] = c
+                out.append(item)
+
+    out = filter_last_7_days(out)
+    out.sort(key=lambda x: x.get("pubDate",""), reverse=True)
+    return out[:150]
+
+# -----------------------------
+# API ENDPOINTS (MATCHES APP.JS EXACTLY)
+# -----------------------------
+@api.get("/companies/search")
+async def search(q: str):
+    ql = q.lower().strip()
+    if not ql: return []
+    starts = [c for c in COMPANY_NAMES if c.lower().startswith(ql)]
+    if starts: return starts[:50]
+    contains = [c for c in COMPANY_NAMES if ql in c.lower()]
+    return contains[:50]
+
+@api.get("/news/all")
+async def news_all():
+    return {"news": build_all(), "count": len(build_all())}
+
+@api.get("/news/results")
+async def news_results():
+    return {"news": build_results(), "count": len(build_results())}
+
+@api.get("/news/company/{name}")
+async def news_company(name: str):
+    return {"company": name, "news": NEWS_CACHE.get(name, {}).get("news", [])}
+
+@api.get("/news/sector/{sector}")
+async def news_sector(sector: str):
+    sec = sector.upper().replace(" ", "")
+    if sec == "PENNY":
+        return {"news": build_sector(["penny", "microcap"]), "count": 150}
+    if sec == "LARGECAP":
+        return {"news": build_sector(["largecap"]), "count": 150}
+    if sec == "MIDCAP":
+        return {"news": build_sector(["midcap"]), "count": 150}
+    if sec == "SMALLCAP":
+        return {"news": build_sector(["smallcap"]), "count": 150}
+
+    kw = SECTOR_KEYWORDS.get(sec, [sector])
+    return {"news": build_sector(kw), "count": 150}
+
+@api.get("/status")
+async def status():
+    return {
+        "companies": len(COMPANY_NAMES),
+        "cached": len(NEWS_CACHE),
+        "cache_minutes": CACHE_DURATION // 60
+    }
+
+@api.get("/ping")
+async def ping():
+    return {"alive": True}
+
+app.include_router(api)
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+# -----------------------------
+# STARTUP
+# -----------------------------
+@app.on_event("startup")
+async def start():
+    load_company_names()
+    load_cache()
+    asyncio.create_task(updater_loop())
+    asyncio.create_task(periodic_save())
+    logger.info("Startup complete (PDF version).")
+
+
 import feedparser
 import PyPDF2
 
