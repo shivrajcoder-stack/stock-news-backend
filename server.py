@@ -256,7 +256,7 @@ def build_penny():
 # -----------------------------
 # API ENDPOINTS
 # -----------------------------
-@api_router.get("/news")
+@api_router.get("/news/all")
 async def api_all():
     normalize_news_cache()
     return {"news": build_all()}
