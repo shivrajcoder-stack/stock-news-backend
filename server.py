@@ -106,19 +106,6 @@ IMPACT_KEYWORDS = GOOD_KEYWORDS + BAD_KEYWORDS + [
 # -----------------------------
 # Utilities
 # -----------------------------
-def within_last_48_hours(item: Dict) -> bool:
-    """Used for Option B: Prefer today, fallback yesterday."""
-    pub = item.get("pubDate", "")
-    if not pub:
-        return False
-    dt = parse_date(pub)
-    if not dt:
-        return False
-    now = datetime.now(timezone.utc)
-    return (now - dt).days <= 1  # today or yesterday only
-
-
-
 def clean_html(text: Optional[str]) -> str:
     if not text:
         return ""
@@ -177,6 +164,7 @@ def normalize_news_cache():
             pub = item.get("pubDate")
             parsed = parse_date(str(pub))
             item["pubDate"] = parsed.isoformat() if parsed else (pub or "")
+
 # -----------------------------
 # Load companies from PDF
 # -----------------------------
@@ -363,65 +351,68 @@ def within_days(item: Dict, days: int) -> bool:
 # -----------------------------
 # Builders for API sections
 # -----------------------------
-def build_index_section(limit=50):
+def build_index_section(limit=50, days: Optional[int] = None):
+    """Collect index-related items (nifty / sensex / banknifty keywords)"""
     results = []
     added = set()
-
     for company, cache in NEWS_CACHE.items():
         for n in cache.get("news", []):
-            txt = (n.get("title","") + " " + n.get("description","")).lower()
-
+            txt = (n.get("title", "") + " " + n.get("description", "")).lower()
             if any(k in txt for k in INDEX_NEWS_KEYS):
-                if not within_last_48_hours(n):
+                if days and not within_days(n, days):
                     continue
-
                 item = n.copy()
                 item["company"] = company
                 results.append(item)
-                added.add(company)
+                added.add((company, item.get("title", "")))
                 break
-
         if len(results) >= limit:
             break
-
     results = remove_duplicates(results)
-    results.sort(key=lambda it: it.get("pubDate",""), reverse=True)
+    try:
+        results.sort(key=lambda it: it.get("pubDate", ""), reverse=True)
+    except Exception:
+        pass
     return results[:limit]
 
 
-def build_largecap_section(limit=60):
+def build_largecap_section(limit=60, days: Optional[int] = None):
+    """Collect news for TOP_STOCKS (large / famous stocks)."""
     items = []
-
     for top in TOP_STOCKS:
         for n in NEWS_CACHE.get(top, {}).get("news", []):
-            if within_last_48_hours(n):
-                x = n.copy()
-                x["company"] = top
-                items.append(x)
-                break  # only 1 top item
+            if days and not within_days(n, days):
+                continue
+            x = n.copy()
+            x["company"] = top
+            items.append(x)
+            break
         if len(items) >= limit:
             break
-
     items = remove_duplicates(items)
-    items.sort(key=lambda it: it.get("pubDate",""), reverse=True)
+    try:
+        items.sort(key=lambda it: it.get("pubDate", ""), reverse=True)
+    except Exception:
+        pass
     return items[:limit]
 
 
-
-def build_general_section(limit=150):
-    items = []
-
+def build_general_section(limit=150, days: Optional[int] = None):
+    """General market news (fallback — returns recent items across cache)."""
+    all_items = []
     for company, cache in NEWS_CACHE.items():
         for n in cache.get("news", []):
-            if within_last_48_hours(n):
-                x = n.copy()
-                x["company"] = company
-                items.append(x)
-
-    items = remove_duplicates(items)
-    items.sort(key=lambda it: it.get("pubDate",""), reverse=True)
-    return items[:limit]
-
+            if days and not within_days(n, days):
+                continue
+            x = n.copy()
+            x["company"] = company
+            all_items.append(x)
+    all_items = remove_duplicates(all_items)
+    try:
+        all_items.sort(key=lambda it: it.get("pubDate", ""), reverse=True)
+    except Exception:
+        pass
+    return all_items[:limit]
 
 
 def build_all_section(limit=150, days: Optional[int] = None, only_impact=False):
@@ -595,41 +586,128 @@ async def get_company_news(company_name: str):
 async def get_all_news(
     days: Optional[int] = Query(None, description="Optional filter: last N days"),
     only_impact: Optional[bool] = Query(False, description="If true, only return high impact items"),
-    include_indexes: Optional[bool] = Query(False, description="If true, return grouped sections (indexes/largecap/general)")
+    include_indexes: Optional[bool] = Query(False, description="If true, return grouped sections (indexes/largecap/general)"),
+    same_day: Optional[bool] = Query(False, description="If true, prefer same-day (today) news; fallback to yesterday if none")
 ):
-    # Standard flat list (backwards compatible)
-    items = build_all_section(limit=150, days=days, only_impact=only_impact)
-    for n in items:
-        if "sentiment" not in n:
-            n["sentiment"] = detect_sentiment(n.get("title", "") + " " + n.get("description", ""))
+    """
+    Standard flat list (backwards compatible)
+    If same_day=True -> try to return only today's news (days=0). If no index items today, include largecap/midcap today.
+    If nothing found for today, fallback to yesterday (days=1).
+    """
+    # Normal path when same_day is not requested
+    if not same_day:
+        items = build_all_section(limit=150, days=days, only_impact=only_impact)
+        for n in items:
+            if "sentiment" not in n:
+                n["sentiment"] = detect_sentiment(n.get("title", "") + " " + n.get("description", ""))
+        if include_indexes:
+            indexes = build_index_section(limit=60, days=days)
+            largecap = build_largecap_section(limit=60, days=days)
+            general = build_general_section(limit=150, days=days)
+            for arr in (indexes, largecap, general):
+                for n in arr:
+                    if "sentiment" not in n:
+                        n["sentiment"] = detect_sentiment(n.get("title", "") + " " + n.get("description", ""))
+            return {
+                "sections": {
+                    "indexes": indexes,
+                    "largecap": largecap,
+                    "general": general
+                },
+                "count": len(indexes) + len(largecap) + len(general)
+            }
+        return {"news": items, "count": len(items)}
 
-    # If client wants grouped structure
+    # -----------------------------
+    # same_day=True path
+    # -----------------------------
+    # Try today (days=0)
+    today_days = 0
+    yesterday_days = 1
+
+    indexes = build_index_section(limit=60, days=today_days)
+    largecap = build_largecap_section(limit=60, days=today_days)
+    general = build_general_section(limit=150, days=today_days)
+
+    # If no index-style items today, attempt to include largecap/midcap today (per your request)
+    if not indexes:
+        # If we don't have index news today, still include largecap/midcap/general today if present
+        combined_today = remove_duplicates((largecap or []) + (general or []))
+        if combined_today:
+            # build flat items (or grouped if client asked)
+            flat_today = combined_today[:150]
+            for n in flat_today:
+                if "sentiment" not in n:
+                    n["sentiment"] = detect_sentiment(n.get("title", "") + " " + n.get("description", ""))
+            if include_indexes:
+                # return grouped but indexes empty
+                return {
+                    "sections": {
+                        "indexes": [],
+                        "largecap": largecap,
+                        "general": general
+                    },
+                    "count": len((largecap or [])) + len((general or []))
+                }
+            return {"news": flat_today, "count": len(flat_today)}
+
+    # If indexes exist today (good), return sections today
+    if indexes:
+        if include_indexes:
+            for arr in (indexes, largecap, general):
+                for n in arr:
+                    if "sentiment" not in n:
+                        n["sentiment"] = detect_sentiment(n.get("title", "") + " " + n.get("description", ""))
+            return {
+                "sections": {
+                    "indexes": indexes,
+                    "largecap": largecap,
+                    "general": general
+                },
+                "count": len(indexes) + len(largecap) + len(general)
+            }
+        # flatten in index-first order
+        flat = remove_duplicates(indexes + largecap + general)[:150]
+        for n in flat:
+            if "sentiment" not in n:
+                n["sentiment"] = detect_sentiment(n.get("title", "") + " " + n.get("description", ""))
+        return {"news": flat, "count": len(flat)}
+
+    # If reached here there was nothing for today. Fallback to yesterday (days=1)
+    indexes_y = build_index_section(limit=60, days=yesterday_days)
+    largecap_y = build_largecap_section(limit=60, days=yesterday_days)
+    general_y = build_general_section(limit=150, days=yesterday_days)
+
+    # If still nothing, finally fall back to standard build_all_section without day filter
+    if not (indexes_y or largecap_y or general_y):
+        fallback_items = build_all_section(limit=150, days=None, only_impact=only_impact)
+        for n in fallback_items:
+            if "sentiment" not in n:
+                n["sentiment"] = detect_sentiment(n.get("title", "") + " " + n.get("description", ""))
+        if include_indexes:
+            idx = build_index_section(limit=60, days=None)
+            lc = build_largecap_section(limit=60, days=None)
+            gen = build_general_section(limit=150, days=None)
+            for arr in (idx, lc, gen):
+                for n in arr:
+                    if "sentiment" not in n:
+                        n["sentiment"] = detect_sentiment(n.get("title", "") + " " + n.get("description", ""))
+            return {"sections": {"indexes": idx, "largecap": lc, "general": gen}, "count": len(idx) + len(lc) + len(gen)}
+        return {"news": fallback_items, "count": len(fallback_items)}
+
+    # Return yesterday's content
     if include_indexes:
-  indexes = build_index_section(limit=60)
-largecap = build_largecap_section(limit=60)
-general = build_general_section(limit=150)
-
-# Auto-fill if today's index news is low
-if len(indexes) < 3:
-    need = 3 - len(indexes)
-    indexes += largecap[:need]
-
-
-        for arr in (indexes, largecap, general):
+        for arr in (indexes_y, largecap_y, general_y):
             for n in arr:
                 if "sentiment" not in n:
                     n["sentiment"] = detect_sentiment(n.get("title", "") + " " + n.get("description", ""))
+        return {"sections": {"indexes": indexes_y, "largecap": largecap_y, "general": general_y}, "count": len(indexes_y) + len(largecap_y) + len(general_y)}
 
-        return {
-            "sections": {
-                "indexes": indexes,
-                "largecap": largecap,
-                "general": general
-            },
-            "count": len(indexes) + len(largecap) + len(general)
-        }
-
-    return {"news": items, "count": len(items)}
+    flat_y = remove_duplicates((indexes_y or []) + (largecap_y or []) + (general_y or []))[:150]
+    for n in flat_y:
+        if "sentiment" not in n:
+            n["sentiment"] = detect_sentiment(n.get("title", "") + " " + n.get("description", ""))
+    return {"news": flat_y, "count": len(flat_y)}
 
 
 @api_router.get("/news/results")
