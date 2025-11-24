@@ -106,6 +106,19 @@ IMPACT_KEYWORDS = GOOD_KEYWORDS + BAD_KEYWORDS + [
 # -----------------------------
 # Utilities
 # -----------------------------
+def within_last_48_hours(item: Dict) -> bool:
+    """Used for Option B: Prefer today, fallback yesterday."""
+    pub = item.get("pubDate", "")
+    if not pub:
+        return False
+    dt = parse_date(pub)
+    if not dt:
+        return False
+    now = datetime.now(timezone.utc)
+    return (now - dt).days <= 1  # today or yesterday only
+
+
+
 def clean_html(text: Optional[str]) -> str:
     if not text:
         return ""
@@ -350,68 +363,65 @@ def within_days(item: Dict, days: int) -> bool:
 # -----------------------------
 # Builders for API sections
 # -----------------------------
-def build_index_section(limit=50, days: Optional[int] = None):
-    """Collect index-related items (nifty / sensex / banknifty keywords)"""
+def build_index_section(limit=50):
     results = []
     added = set()
+
     for company, cache in NEWS_CACHE.items():
         for n in cache.get("news", []):
-            txt = (n.get("title", "") + " " + n.get("description", "")).lower()
+            txt = (n.get("title","") + " " + n.get("description","")).lower()
+
             if any(k in txt for k in INDEX_NEWS_KEYS):
-                if days and not within_days(n, days):
+                if not within_last_48_hours(n):
                     continue
+
                 item = n.copy()
                 item["company"] = company
                 results.append(item)
-                added.add((company, item.get("title", "")))
+                added.add(company)
                 break
+
         if len(results) >= limit:
             break
+
     results = remove_duplicates(results)
-    try:
-        results.sort(key=lambda it: it.get("pubDate", ""), reverse=True)
-    except Exception:
-        pass
+    results.sort(key=lambda it: it.get("pubDate",""), reverse=True)
     return results[:limit]
 
 
-def build_largecap_section(limit=60, days: Optional[int] = None):
-    """Collect news for TOP_STOCKS (large / famous stocks)."""
+def build_largecap_section(limit=60):
     items = []
+
     for top in TOP_STOCKS:
         for n in NEWS_CACHE.get(top, {}).get("news", []):
-            if days and not within_days(n, days):
-                continue
-            x = n.copy()
-            x["company"] = top
-            items.append(x)
-            break
+            if within_last_48_hours(n):
+                x = n.copy()
+                x["company"] = top
+                items.append(x)
+                break  # only 1 top item
         if len(items) >= limit:
             break
+
     items = remove_duplicates(items)
-    try:
-        items.sort(key=lambda it: it.get("pubDate", ""), reverse=True)
-    except Exception:
-        pass
+    items.sort(key=lambda it: it.get("pubDate",""), reverse=True)
     return items[:limit]
 
 
-def build_general_section(limit=150, days: Optional[int] = None):
-    """General market news (fallback — returns recent items across cache)."""
-    all_items = []
+
+def build_general_section(limit=150):
+    items = []
+
     for company, cache in NEWS_CACHE.items():
         for n in cache.get("news", []):
-            if days and not within_days(n, days):
-                continue
-            x = n.copy()
-            x["company"] = company
-            all_items.append(x)
-    all_items = remove_duplicates(all_items)
-    try:
-        all_items.sort(key=lambda it: it.get("pubDate", ""), reverse=True)
-    except Exception:
-        pass
-    return all_items[:limit]
+            if within_last_48_hours(n):
+                x = n.copy()
+                x["company"] = company
+                items.append(x)
+
+    items = remove_duplicates(items)
+    items.sort(key=lambda it: it.get("pubDate",""), reverse=True)
+    return items[:limit]
+
 
 
 def build_all_section(limit=150, days: Optional[int] = None, only_impact=False):
