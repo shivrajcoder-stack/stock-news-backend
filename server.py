@@ -9,34 +9,28 @@ import re
 import feedparser
 import PyPDF2
 
-from fastapi import FastAPI, APIRouter, Query, Response
+from fastapi import FastAPI, APIRouter, Query
 from starlette.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 from pathlib import Path
 from urllib.parse import quote
 from typing import Dict, List, Optional
-from email.utils import parsedate_to_datetime
-from datetime import datetime, timezone
 
 ROOT_DIR = Path(__file__).parent
-# load .env if present
 load_dotenv(ROOT_DIR / ".env")
 
 app = FastAPI()
 api_router = APIRouter(prefix="/api")
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-)
-logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+logger = logging.getLogger("server")
 
 # -----------------------------
 # Config
 # -----------------------------
 CACHE_FILE = ROOT_DIR / "news_cache.json"
 COMPANY_PDF = ROOT_DIR / "company_list.pdf"
-CACHE_DURATION = 15 * 60  # seconds between full cycles
+CACHE_DURATION = 15 * 60  # 15 minutes rest between cycles
 BATCH_SIZE = 100
 SEMAPHORE_LIMIT = 10
 SAVE_INTERVAL_SECONDS = 60
@@ -50,35 +44,25 @@ INDEX_NEWS_KEYS = ["nifty", "sensex", "banknifty", "nifty bank", "index"]
 
 # -----------------------------
 # Top / Nifty lists
-# (kept your lists)
 # -----------------------------
 TOP_STOCKS = [
-    "Reliance Industries Limited",
-    "Tata Consultancy Services Limited",
-    "HDFC Bank Limited",
-    "ICICI Bank Limited",
-    "Infosys Limited",
-    "Hindustan Unilever Limited",
-    "State Bank of India",
-    "Larsen & Toubro Limited",
-    "Bharti Airtel Limited",
-    "ITC Limited",
-    "Tata Motors Limited",
-    "Kotak Mahindra Bank Limited",
-    "Axis Bank Limited",
-    "Maruti Suzuki India Limited",
-    "Bajaj Finance Limited",
-    "Mahindra & Mahindra Limited",
-    "Wipro Limited",
-    "Power Grid Corporation of India Limited",
-    "Asian Paints Limited",
-    "HCL Technologies Limited"
+    "Reliance Industries Limited", "Tata Consultancy Services Limited",
+    "HDFC Bank Limited", "ICICI Bank Limited", "Infosys Limited",
+    "Hindustan Unilever Limited", "State Bank of India", "Larsen & Toubro Limited",
+    "Bharti Airtel Limited", "ITC Limited", "Tata Motors Limited",
+    "Kotak Mahindra Bank Limited", "Axis Bank Limited", "Maruti Suzuki India Limited",
+    "Bajaj Finance Limited", "Mahindra & Mahindra Limited", "Wipro Limited",
+    "Power Grid Corporation of India Limited", "Asian Paints Limited", "HCL Technologies Limited"
 ]
 
 PENNY_STOCKS = [
-    "Tilaknagar Industries Limited",
-    "3i Infotech Limited",
-    "XYZ Penny Ltd"
+    "Tilaknagar Industries Limited", "3i Infotech Limited", "XYZ Penny Ltd"
+]
+
+# locked sector order (as requested)
+SECTOR_ORDER = [
+    "ALL", "RESULTS", "PENNY", "LARGE CAP", "MIDCAP", "SMALLCAP",
+    "FMCG", "IT", "BANKING", "AUTO", "ENERGY", "PSU", "TELECOM"
 ]
 
 SECTOR_KEYWORDS = {
@@ -98,21 +82,19 @@ SECTOR_KEYWORDS = {
 }
 
 GOOD_KEYWORDS = [
-    "profit", "record", "growth", "surge", "beats", "upgrade",
-    "wins", "strong", "rise", "positive", "acquisition", "expansion"
+    "profit", "record", "growth", "surge", "beats", "upgrade", "wins", "strong",
+    "rise", "positive", "acquisition", "expansion"
 ]
 
 BAD_KEYWORDS = [
-    "loss", "fraud", "scam", "crash", "decline", "penalty",
-    "investigation", "downgrade", "fall", "weak", "slump", "lawsuit"
+    "loss", "fraud", "scam", "crash", "decline", "penalty", "investigation",
+    "downgrade", "fall", "weak", "slump", "lawsuit"
 ]
 
-IMPACT_KEYWORDS = GOOD_KEYWORDS + BAD_KEYWORDS + [
-    "earnings", "results", "investment", "sebi", "revenue"
-]
+IMPACT_KEYWORDS = GOOD_KEYWORDS + BAD_KEYWORDS + ["earnings", "results", "investment", "SEBI", "revenue"]
 
 # -----------------------------
-# Utilities
+# Utilities & Rule-based extractors
 # -----------------------------
 def clean_html(text: Optional[str]) -> str:
     if not text:
@@ -144,48 +126,78 @@ def remove_duplicates(news_list: List[Dict]) -> List[Dict]:
         out.append(n)
     return out
 
-def parse_date(value: str) -> Optional[datetime]:
-    """Try to parse RSS pubDate-style strings into timezone-aware datetimes."""
-    if not value:
-        return None
-    try:
-        dt = parsedate_to_datetime(value)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt
-    except Exception:
-        # fallback: try common ISO
-        try:
-            return datetime.fromisoformat(value)
-        except Exception:
-            return None
+# numeric helpers
+_re_money = re.compile(r"(?:₹|Rs\.?|INR)\s?[\d,]+(?:\.\d+)?", flags=re.I)
+_re_percent = re.compile(r"\d{1,3}\.\d+%|\d{1,3}%")
+_re_number = re.compile(r"\b\d{1,3}(?:,\d{3})*(?:\.\d+)?\b")
 
-def normalize_news_cache():
-    """
-    Ensure all pubDate and timestamps are JSON serializable (strings / numbers).
-    Run this before writing to disk.
-    """
-    for company, data in list(NEWS_CACHE.items()):
-        # normalize timestamp to float (epoch seconds)
-        ts = data.get("timestamp")
-        if isinstance(ts, datetime):
-            data["timestamp"] = ts.timestamp()
-        # normalize news items
-        for item in data.get("news", []):
-            pub = item.get("pubDate")
-            if isinstance(pub, datetime):
-                # ISO string
-                item["pubDate"] = pub.isoformat()
-            elif pub is None:
-                item["pubDate"] = ""
-            else:
-                # try to parse and reformat to ISO if it looks like an RSS date
-                parsed = parse_date(str(pub))
-                if parsed:
-                    item["pubDate"] = parsed.isoformat()
-                else:
-                    # keep as string
-                    item["pubDate"] = str(pub)
+# extract structured facts from text using rules
+def extract_financial_facts(text: str) -> Dict:
+    facts = {}
+    if not text:
+        return facts
+    t = text
+
+    # money values
+    monies = _re_money.findall(t)
+    if monies:
+        facts["monies"] = monies
+
+    # percents
+    percents = _re_percent.findall(t)
+    if percents:
+        facts["percents"] = percents
+
+    # EPS pattern
+    m = re.search(r"\b(EPS|earnings per share)\b[: ]*\s*([₹Rs\.]*\s*\d+[\d,\.]*)", t, flags=re.I)
+    if m:
+        facts["eps"] = m.group(2).strip()
+
+    # revenue / net profit matches
+    rev = re.search(r"(?:revenue|sales)[^0-9\n]{0,20}([₹Rs\.]*\s*[\d,]+(?:\.\d+)?)", t, flags=re.I)
+    if rev:
+        facts["revenue"] = rev.group(1).strip()
+
+    profit = re.search(r"(?:net profit|profit after tax|PAT|net income)[^0-9\n]{0,20}([₹Rs\.]*\s*[\d,]+(?:\.\d+)?)", t, flags=re.I)
+    if profit:
+        facts["net_profit"] = profit.group(1).strip()
+
+    # dividend
+    div = re.search(r"(?:dividend|payout)[^0-9\n]{0,20}([₹Rs\.]*\s*[\d,]+(?:\.\d+)?(?:\s*/\s*share|\s*per\s*share)?)", t, flags=re.I)
+    if div:
+        facts["dividend"] = div.group(1).strip()
+
+    # buyback
+    buy = re.search(r"(?:buyback|repurchase)[^0-9\n]{0,40}([₹Rs\.]*\s*[\d,]+(?:\.\d+)?)", t, flags=re.I)
+    if buy:
+        facts["buyback_amount"] = buy.group(1).strip()
+
+    # guidance phrase detect
+    guidance_phrases = re.search(r"(?:guidance|expects|expects to|expects growth|outlook|forecast|target)\s*[:\-\sa-z0-9,()%]*", t, flags=re.I)
+    if guidance_phrases:
+        facts["guidance_snippet"] = guidance_phrases.group(0).strip()
+
+    return facts
+
+# detect if news is 'results' type
+def is_results_news(text: str) -> bool:
+    t = text.lower()
+    return any(k in t for k in ["q1", "q2", "q3", "q4", "quarter", "quarterly", "annual", "yearly", "results", "earnings", "net profit", "revenue", "pat", "eps"])
+
+# find mentioned companies (best-effort): match company names
+def find_companies_in_text(text: str, max_hits=12) -> List[str]:
+    found = []
+    tl = text.lower()
+    # simple scan of company names (fast enough)
+    for c in COMPANY_NAMES:
+        if c.lower() in tl:
+            found.append(c)
+            if len(found) >= max_hits:
+                break
+    return found
+
+def remove_html_and_trim(s: str) -> str:
+    return clean_html(s)[:1000]  # limit length for summaries
 
 # -----------------------------
 # Load companies from PDF
@@ -214,6 +226,7 @@ def load_company_names():
 # Persistent cache load/save
 # -----------------------------
 def load_cache_from_file():
+    global NEWS_CACHE
     if CACHE_FILE.exists():
         try:
             with open(CACHE_FILE, "r") as f:
@@ -227,10 +240,8 @@ def load_cache_from_file():
 async def save_cache_periodically():
     while True:
         try:
-            normalize_news_cache()
-            # use default=str as a last-resort fallback
             with open(CACHE_FILE, "w") as f:
-                json.dump(NEWS_CACHE, f, ensure_ascii=False, indent=2, default=str)
+                json.dump(NEWS_CACHE, f)
             logger.info(f"Saved cache to file ({len(NEWS_CACHE)} companies)")
         except Exception as e:
             logger.error(f"Error saving cache file: {e}")
@@ -249,7 +260,8 @@ async def fetch_company_news(company_name: str) -> List[Dict]:
             title = clean_html(entry.get("title", "") or "")
             summary = clean_html(entry.get("summary", "") or entry.get("description", "") or "")
             link = entry.get("link", "") or entry.get("id", "")
-            pubDate = entry.get("published", "") or entry.get("updated", "") or ""
+            pubDate = entry.get("published", "") or entry.get("updated", "")
+            # Create concise summary: keep two lines max (title or short summary)
             text_combined = (title + " " + summary).strip()
             news_items.append({
                 "title": title,
@@ -259,12 +271,6 @@ async def fetch_company_news(company_name: str) -> List[Dict]:
                 "raw_text": text_combined
             })
         news_items = remove_duplicates(news_items)
-        # normalize pubDate as ISO if possible so later comparisons are easier
-        for n in news_items:
-            p = n.get("pubDate","")
-            parsed = parse_date(p)
-            if parsed:
-                n["pubDate"] = parsed.isoformat()
         return news_items[:5]
     except Exception as e:
         logger.error(f"fetch error for {company_name}: {e}")
@@ -279,7 +285,10 @@ async def update_one_company(company: str):
         for n in news:
             txt = (n.get("title","") + " " + n.get("description","")).strip()
             n["sentiment"] = detect_sentiment(txt)
-            n["mentioned_companies"] = []  # keep placeholder
+            n["summary"] = generate_short_summary(n)
+            n["facts"] = extract_financial_facts(txt)
+            # list of companies mentioned (helps list extraction)
+            n["mentioned_companies"] = find_companies_in_text(txt)
         if news:
             NEWS_CACHE[company] = {"news": news, "timestamp": time.time()}
         elif company not in NEWS_CACHE:
@@ -312,85 +321,100 @@ async def background_news_updater():
                 batch = COMPANY_NAMES[i:i+BATCH_SIZE]
                 logger.info(f"Updater: processing batch {i//BATCH_SIZE + 1} / {(total + BATCH_SIZE - 1)//BATCH_SIZE} ({len(batch)} companies)")
                 await update_batch(batch)
+                # small random sleep between batches to reduce burst
                 await asyncio.sleep(random.uniform(0.5, 1.5))
             logger.info(f"Background update cycle finished. Cached companies: {len(NEWS_CACHE)}")
+            # rest for configured duration before next full cycle
             await asyncio.sleep(CACHE_DURATION)
         except Exception as e:
             logger.error(f"Background updater crashed: {e}")
             await asyncio.sleep(60)
 
 # -----------------------------
-# Simple helpers for builders
+# Summary generator (rule-based)
 # -----------------------------
-def is_high_impact(text: str) -> bool:
-    t = text.lower()
-    return any(k in t for k in IMPACT_KEYWORDS)
+def generate_short_summary(item: Dict) -> str:
+    """
+    Create a concise 1-2 line summary from title/description and extracted facts.
+    """
+    title = item.get("title", "") or ""
+    desc = item.get("description", "") or ""
+    txt = (title + " " + desc).strip()
 
-def within_days(item: Dict, days: int) -> bool:
-    """Return True if item's pubDate is within `days` from now.
-       If pubDate can't be parsed, return True (conservative)."""
-    if not days:
-        return True
-    pub = item.get("pubDate","")
-    if not pub:
-        return False
-    dt = parse_date(pub)
-    if not dt:
-        # if we can't parse, include conservatively
-        return True
-    now = datetime.now(timezone.utc)
-    delta = now - dt
-    return delta.days <= days
+    # If results-type, attempt to include revenue/profit/eps/dividend
+    facts = extract_financial_facts(txt)
+    parts = []
+
+    # priority: facts (revenue/profit/dividend/eps/buyback)
+    if "revenue" in facts:
+        parts.append(f"Revenue: {facts['revenue']}")
+    if "net_profit" in facts:
+        parts.append(f"Net profit: {facts['net_profit']}")
+    if "eps" in facts:
+        parts.append(f"EPS: {facts['eps']}")
+    if "dividend" in facts:
+        parts.append(f"Dividend: {facts['dividend']}")
+    if "buyback_amount" in facts:
+        parts.append(f"Buyback: {facts['buyback_amount']}")
+
+    # if we have parts, join into short summary
+    if parts:
+        return " • ".join(parts)
+
+    # if not, use the first concise sentence from description
+    if desc:
+        # pick first 1-2 sentences
+        sentences = re.split(r'(?<=[\.\?\!])\s+', desc)
+        if sentences and sentences[0].strip():
+            s = sentences[0].strip()
+            if len(s) > 180:
+                s = s[:177].rsplit(' ',1)[0] + "..."
+            return s
+    # fallback to title
+    if title:
+        t = title
+        if len(t) > 160:
+            t = t[:157].rsplit(' ',1)[0] + "..."
+        return t
+    return ""
 
 # -----------------------------
 # Builders for API sections
 # -----------------------------
-def build_all_section(limit=150, days: Optional[int]=None, only_impact=False):
+def build_all_section(limit=150):
     """
-    ALL section: index/news first, then TOP_STOCKS, then other impactful companies.
-    If days is provided (int), only include items within that many days.
-    If only_impact is True, prefer/only include high-impact items.
+    ALL section: index/news first, then TOP_STOCKS (1 item each), then other impactful companies.
+    Ensures variety and recent-first ordering inside each group.
     """
     results = []
     added = set()
 
-    # 1) index-like news first
+    # 1) index news first
     for company, cache in NEWS_CACHE.items():
         for n in cache.get("news", []):
             txt = (n.get("title","") + " " + n.get("description","")).lower()
             if any(k in txt for k in INDEX_NEWS_KEYS):
-                if days and not within_days(n, days):
-                    continue
                 item = n.copy(); item["company"] = company
                 results.append(item)
                 added.add(company)
                 break
 
-    # 2) top stocks (prefer high impact)
+    # 2) top stocks
     for top in TOP_STOCKS:
         if top in NEWS_CACHE and top not in added:
             candidates = NEWS_CACHE[top].get("news", [])
-            # sort: high impact first then recent
+            # pick the most 'impactful' item
             candidates = sorted(candidates, key=lambda it: (not is_high_impact(it.get("title","") + " " + it.get("description","")), it.get("pubDate","")), reverse=False)
-            for cand in candidates:
-                if days and not within_days(cand, days):
-                    continue
-                if only_impact and not is_high_impact(cand.get("title","") + " " + cand.get("description","")):
-                    continue
-                chosen = cand
+            if candidates:
+                chosen = candidates[0]
                 x = chosen.copy(); x["company"] = top
                 results.append(x)
                 added.add(top)
-                break
 
     # 3) impactful others
     for company, cache in NEWS_CACHE.items():
         if company in added: continue
         for n in cache.get("news", []):
-            if days and not within_days(n, days):
-                continue
-            if only_impact and not is_high_impact(n.get("title","") + " " + n.get("description","")):
-                continue
             if is_high_impact(n.get("title","") + " " + n.get("description","")):
                 x = n.copy(); x["company"] = company
                 results.append(x)
@@ -399,15 +423,11 @@ def build_all_section(limit=150, days: Optional[int]=None, only_impact=False):
         if len(results) >= limit:
             break
 
-    # 4) fill with recent / diverse if needed
+    # 4) fill with diverse recent items if needed
     if len(results) < limit:
         for company, cache in NEWS_CACHE.items():
             if company in added: continue
             for n in cache.get("news", []):
-                if days and not within_days(n, days):
-                    continue
-                if only_impact and not is_high_impact(n.get("title","") + " " + n.get("description","")):
-                    continue
                 x = n.copy(); x["company"] = company
                 results.append(x)
                 added.add(company)
@@ -416,40 +436,47 @@ def build_all_section(limit=150, days: Optional[int]=None, only_impact=False):
                 break
 
     results = remove_duplicates(results)
+    # try to sort by pubDate descending (best-effort)
     try:
         results.sort(key=lambda it: it.get("pubDate",""), reverse=True)
     except:
         pass
     return results[:limit]
 
-def build_results_section(limit=150, days: Optional[int]=None):
+def build_results_section(limit=150):
+    """
+    Build RESULTS section: include quarterly/annual/dividend/buyback/guidance items.
+    """
     results = []
+    added = set()
     for company, cache in NEWS_CACHE.items():
         for n in cache.get("news", []):
-            if days and not within_days(n, days):
-                continue
             txt = (n.get("title","") + " " + n.get("description","")).lower()
-            if any(k in txt for k in ["q1","q2","q3","q4","quarter","quarterly","annual","yearly","results","earnings","net profit","revenue","pat","eps"]):
+            if is_results_news(txt) or any(k in txt for k in ["dividend", "buyback", "repurchase", "guidance", "forecast", "outlook"]):
                 x = n.copy(); x["company"] = company
+                # ensure structured facts are present
+                if "facts" not in x:
+                    x["facts"] = extract_financial_facts(txt)
+                x["summary"] = generate_short_summary(x)
                 results.append(x)
+                added.add(company)
                 break
         if len(results) >= limit:
             break
+
+    # sort by recency
     try:
         results.sort(key=lambda it: it.get("pubDate",""), reverse=True)
     except:
         pass
     return remove_duplicates(results)[:limit]
 
-def build_sector_section(keywords: List[str], limit=150, days: Optional[int]=None):
+def build_sector_section(keywords: List[str], limit=150):
     items = []
-    keys = [k.lower() for k in keywords]
     for company, cache in NEWS_CACHE.items():
         for n in cache.get("news", []):
-            if days and not within_days(n, days):
-                continue
             txt = (n.get("title","") + " " + n.get("description","")).lower()
-            if any(k in txt for k in keys):
+            if any(k.lower() in txt for k in keywords):
                 x = n.copy(); x["company"] = company
                 items.append(x)
     items = remove_duplicates(items)
@@ -459,12 +486,10 @@ def build_sector_section(keywords: List[str], limit=150, days: Optional[int]=Non
         pass
     return items[:limit]
 
-def build_penny_section(limit=150, days: Optional[int]=None):
+def build_penny_section(limit=150):
     items = []
     for p in PENNY_STOCKS:
         for n in NEWS_CACHE.get(p, {}).get("news", []):
-            if days and not within_days(n, days):
-                continue
             x = n.copy(); x["company"] = p
             items.append(x)
     items = remove_duplicates(items)
@@ -473,6 +498,10 @@ def build_penny_section(limit=150, days: Optional[int]=None):
     except:
         pass
     return items[:limit]
+
+def is_high_impact(text: str) -> bool:
+    t = text.lower()
+    return any(k in t for k in IMPACT_KEYWORDS)
 
 # -----------------------------
 # API endpoints
@@ -490,52 +519,61 @@ async def search_companies(q: str = Query("", description="Search query")):
 @api_router.get("/news/company/{company_name}")
 async def get_company_news(company_name: str):
     news = NEWS_CACHE.get(company_name, {}).get("news", [])
+    # ensure sentiment and summary
     for n in news:
         if "sentiment" not in n:
             n["sentiment"] = detect_sentiment(n.get("title","") + " " + n.get("description",""))
+        if "summary" not in n:
+            n["summary"] = generate_short_summary(n)
+        if "facts" not in n:
+            n["facts"] = extract_financial_facts(n.get("title","") + " " + n.get("description",""))
     return {"company": company_name, "news": news}
 
 @api_router.get("/news/all")
-async def get_all_news(days: Optional[int] = Query(None, description="Optional filter: last N days"),
-                       only_impact: Optional[bool] = Query(False, description="If true, only return high impact items")):
-    items = build_all_section(limit=150, days=days, only_impact=only_impact)
+async def get_all_news():
+    items = build_all_section(limit=150)
     for n in items:
         if "sentiment" not in n:
             n["sentiment"] = detect_sentiment(n.get("title","") + " " + n.get("description",""))
+        if "summary" not in n:
+            n["summary"] = generate_short_summary(n)
     return {"news": items, "count": len(items)}
 
 @api_router.get("/news/results")
-async def get_results_news(days: Optional[int] = Query(None)):
-    items = build_results_section(limit=200, days=days)
+async def get_results_news():
+    items = build_results_section(limit=200)
     for n in items:
         if "sentiment" not in n:
             n["sentiment"] = detect_sentiment(n.get("title","") + " " + n.get("description",""))
+        if "summary" not in n:
+            n["summary"] = generate_short_summary(n)
     return {"news": items, "count": len(items)}
 
 @api_router.get("/news/sector/{sector_name}")
-async def get_sector_news(sector_name: str, days: Optional[int] = Query(None)):
+async def get_sector_news(sector_name: str):
     s = sector_name.upper()
     if s == "PENNY":
-        items = build_penny_section(days=days)
+        items = build_penny_section()
     elif s == "LARGECAP" or s == "LARGE CAP":
+        # LARGE CAP -> top stocks
         items = []
         for top in TOP_STOCKS:
             for n in NEWS_CACHE.get(top, {}).get("news", []):
-                if days and not within_days(n, days):
-                    continue
                 x = n.copy(); x["company"] = top
                 items.append(x)
     elif s == "MIDCAP":
-        items = build_sector_section(["midcap"], days=days)
+        items = build_sector_section(["midcap"])
     elif s == "SMALLCAP":
-        items = build_sector_section(["smallcap"], days=days)
+        items = build_sector_section(["smallcap"])
     else:
         keywords = SECTOR_KEYWORDS.get(s, [sector_name])
-        items = build_sector_section(keywords, days=days)
+        items = build_sector_section(keywords)
 
     for n in items:
         if "sentiment" not in n:
             n["sentiment"] = detect_sentiment(n.get("title","") + " " + n.get("description",""))
+        if "summary" not in n:
+            n["summary"] = generate_short_summary(n)
     return {"news": items, "count": len(items)}
 
 @api_router.get("/status")
@@ -549,12 +587,6 @@ async def get_status():
 @api_router.get("/ping")
 async def ping():
     return {"status": "alive", "time": time.time()}
-
-# Root path to avoid 404 when someone hits /
-@app.get("/")
-async def root():
-    html = "<html><body><h2>Stock News Backend</h2><p>API available at <code>/api/</code></p></body></html>"
-    return Response(content=html, media_type="text/html")
 
 # -----------------------------
 # App wiring
@@ -579,9 +611,8 @@ async def startup_event():
 async def shutdown_event():
     logger.info("Server shutting down: saving cache...")
     try:
-        normalize_news_cache()
         with open(CACHE_FILE, "w") as f:
-            json.dump(NEWS_CACHE, f, ensure_ascii=False, indent=2, default=str)
+            json.dump(NEWS_CACHE, f)
         logger.info("Shutdown saved cache")
     except Exception as e:
         logger.error(f"Error saving cache on shutdown: {e}")
