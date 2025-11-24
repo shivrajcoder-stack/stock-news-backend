@@ -605,9 +605,15 @@ async def get_all_news(
 
     # If client wants grouped structure
     if include_indexes:
-        indexes = build_index_section(limit=60, days=days)
-        largecap = build_largecap_section(limit=60, days=days)
-        general = build_general_section(limit=150, days=days)
+  indexes = build_index_section(limit=60)
+largecap = build_largecap_section(limit=60)
+general = build_general_section(limit=150)
+
+# Auto-fill if today's index news is low
+if len(indexes) < 3:
+    need = 3 - len(indexes)
+    indexes += largecap[:need]
+
 
         for arr in (indexes, largecap, general):
             for n in arr:
