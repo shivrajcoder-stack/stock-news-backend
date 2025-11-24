@@ -19,15 +19,13 @@ from email.utils import parsedate_to_datetime
 from datetime import datetime, timezone
 
 ROOT_DIR = Path(__file__).parent
-# load .env if present
 load_dotenv(ROOT_DIR / ".env")
 
 app = FastAPI()
 api_router = APIRouter(prefix="/api")
 
 logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+    level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
 
@@ -48,10 +46,6 @@ COMPANY_NAMES: List[str] = []
 NEWS_CACHE: Dict[str, Dict] = {}  # company -> {"news": [...], "timestamp": t}
 INDEX_NEWS_KEYS = ["nifty", "sensex", "banknifty", "nifty bank", "index"]
 
-# -----------------------------
-# Top / Nifty lists
-# (kept your lists)
-# -----------------------------
 TOP_STOCKS = [
     "Reliance Industries Limited",
     "Tata Consultancy Services Limited",
@@ -145,7 +139,6 @@ def remove_duplicates(news_list: List[Dict]) -> List[Dict]:
     return out
 
 def parse_date(value: str) -> Optional[datetime]:
-    """Try to parse RSS pubDate-style strings into timezone-aware datetimes."""
     if not value:
         return None
     try:
@@ -154,37 +147,27 @@ def parse_date(value: str) -> Optional[datetime]:
             dt = dt.replace(tzinfo=timezone.utc)
         return dt
     except Exception:
-        # fallback: try common ISO
         try:
             return datetime.fromisoformat(value)
         except Exception:
             return None
 
 def normalize_news_cache():
-    """
-    Ensure all pubDate and timestamps are JSON serializable (strings / numbers).
-    Run this before writing to disk.
-    """
     for company, data in list(NEWS_CACHE.items()):
-        # normalize timestamp to float (epoch seconds)
         ts = data.get("timestamp")
         if isinstance(ts, datetime):
             data["timestamp"] = ts.timestamp()
-        # normalize news items
         for item in data.get("news", []):
             pub = item.get("pubDate")
             if isinstance(pub, datetime):
-                # ISO string
                 item["pubDate"] = pub.isoformat()
             elif pub is None:
                 item["pubDate"] = ""
             else:
-                # try to parse and reformat to ISO if it looks like an RSS date
                 parsed = parse_date(str(pub))
                 if parsed:
                     item["pubDate"] = parsed.isoformat()
                 else:
-                    # keep as string
                     item["pubDate"] = str(pub)
 
 # -----------------------------
@@ -228,7 +211,6 @@ async def save_cache_periodically():
     while True:
         try:
             normalize_news_cache()
-            # use default=str as a last-resort fallback
             with open(CACHE_FILE, "w") as f:
                 json.dump(NEWS_CACHE, f, ensure_ascii=False, indent=2, default=str)
             logger.info(f"Saved cache to file ({len(NEWS_CACHE)} companies)")
@@ -259,7 +241,6 @@ async def fetch_company_news(company_name: str) -> List[Dict]:
                 "raw_text": text_combined
             })
         news_items = remove_duplicates(news_items)
-        # normalize pubDate as ISO if possible so later comparisons are easier
         for n in news_items:
             p = n.get("pubDate","")
             parsed = parse_date(p)
@@ -279,7 +260,7 @@ async def update_one_company(company: str):
         for n in news:
             txt = (n.get("title","") + " " + n.get("description","")).strip()
             n["sentiment"] = detect_sentiment(txt)
-            n["mentioned_companies"] = []  # keep placeholder
+            n["mentioned_companies"] = []
         if news:
             NEWS_CACHE[company] = {"news": news, "timestamp": time.time()}
         elif company not in NEWS_CACHE:
@@ -298,7 +279,7 @@ async def update_batch(companies: List[str]):
     await asyncio.gather(*[worker(c) for c in companies], return_exceptions=True)
 
 # -----------------------------
-# Background loop
+# Background updater
 # -----------------------------
 async def background_news_updater():
     logger.info("Background updater started")
@@ -320,15 +301,13 @@ async def background_news_updater():
             await asyncio.sleep(60)
 
 # -----------------------------
-# Simple helpers for builders
+# Helpers for filtering/sorting
 # -----------------------------
 def is_high_impact(text: str) -> bool:
     t = text.lower()
     return any(k in t for k in IMPACT_KEYWORDS)
 
 def within_days(item: Dict, days: int) -> bool:
-    """Return True if item's pubDate is within `days` from now.
-       If pubDate can't be parsed, return True (conservative)."""
     if not days:
         return True
     pub = item.get("pubDate","")
@@ -336,7 +315,6 @@ def within_days(item: Dict, days: int) -> bool:
         return False
     dt = parse_date(pub)
     if not dt:
-        # if we can't parse, include conservatively
         return True
     now = datetime.now(timezone.utc)
     delta = now - dt
@@ -345,6 +323,69 @@ def within_days(item: Dict, days: int) -> bool:
 # -----------------------------
 # Builders for API sections
 # -----------------------------
+def build_index_section(limit=50, days: Optional[int]=None):
+    """Collect index-related items (nifty / sensex / banknifty keywords)"""
+    results = []
+    added = set()
+    for company, cache in NEWS_CACHE.items():
+        for n in cache.get("news", []):
+            txt = (n.get("title","") + " " + n.get("description","")).lower()
+            if any(k in txt for k in INDEX_NEWS_KEYS):
+                if days and not within_days(n, days):
+                    continue
+                item = n.copy(); item["company"] = company
+                results.append(item)
+                added.add((company, item.get("title","")))
+                break
+        if len(results) >= limit:
+            break
+    results = remove_duplicates(results)
+    try:
+        results.sort(key=lambda it: it.get("pubDate",""), reverse=True)
+    except:
+        pass
+    return results[:limit]
+
+def build_largecap_section(limit=60, days: Optional[int]=None):
+    """Collect news for TOP_STOCKS (large / famous stocks)."""
+    items = []
+    for top in TOP_STOCKS:
+        for n in NEWS_CACHE.get(top, {}).get("news", []):
+            if days and not within_days(n, days):
+                continue
+            x = n.copy(); x["company"] = top
+            items.append(x)
+            break
+        if len(items) >= limit:
+            break
+    items = remove_duplicates(items)
+    try:
+        items.sort(key=lambda it: it.get("pubDate",""), reverse=True)
+    except:
+        pass
+    return items[:limit]
+
+def build_general_section(limit=150, days: Optional[int]=None):
+    """General market news (fallback mostly using existing build_all logic but lighter)."""
+    results = []
+    added = set()
+    # start by adding index-like then top stocks then others (but deduped)
+    # Reuse build_all_section with smaller limit but return as general.
+    from itertools import islice
+    all_items = []
+    for company, cache in NEWS_CACHE.items():
+        for n in cache.get("news", []):
+            if days and not within_days(n, days):
+                continue
+            x = n.copy(); x["company"] = company
+            all_items.append(x)
+    all_items = remove_duplicates(all_items)
+    try:
+        all_items.sort(key=lambda it: it.get("pubDate",""), reverse=True)
+    except:
+        pass
+    return all_items[:limit]
+
 def build_all_section(limit=150, days: Optional[int]=None, only_impact=False):
     """
     ALL section: index/news first, then TOP_STOCKS, then other impactful companies.
@@ -496,12 +537,31 @@ async def get_company_news(company_name: str):
     return {"company": company_name, "news": news}
 
 @api_router.get("/news/all")
-async def get_all_news(days: Optional[int] = Query(None, description="Optional filter: last N days"),
-                       only_impact: Optional[bool] = Query(False, description="If true, only return high impact items")):
+async def get_all_news(
+    days: Optional[int] = Query(None, description="Optional filter: last N days"),
+    only_impact: Optional[bool] = Query(False, description="If true, only return high impact items"),
+    include_indexes: Optional[bool] = Query(False, description="If true, return grouped sections (indexes/largecap/general)")
+):
+    # Standard flat list (backwards compatible)
     items = build_all_section(limit=150, days=days, only_impact=only_impact)
     for n in items:
         if "sentiment" not in n:
             n["sentiment"] = detect_sentiment(n.get("title","") + " " + n.get("description",""))
+
+    # If client wants grouped sections, assemble them and return sections object
+    if include_indexes:
+        indexes = build_index_section(limit=60, days=days)
+        largecap = build_largecap_section(limit=60, days=days)
+        general = build_general_section(limit=150, days=days)
+
+        # ensure sentiment fields
+        for arr in (indexes, largecap, general):
+            for n in arr:
+                if "sentiment" not in n:
+                    n["sentiment"] = detect_sentiment(n.get("title","") + " " + n.get("description",""))
+
+        return {"sections": {"indexes": indexes, "largecap": largecap, "general": general}, "count": len(indexes) + len(largecap) + len(general)}
+
     return {"news": items, "count": len(items)}
 
 @api_router.get("/news/results")
@@ -518,13 +578,7 @@ async def get_sector_news(sector_name: str, days: Optional[int] = Query(None)):
     if s == "PENNY":
         items = build_penny_section(days=days)
     elif s == "LARGECAP" or s == "LARGE CAP":
-        items = []
-        for top in TOP_STOCKS:
-            for n in NEWS_CACHE.get(top, {}).get("news", []):
-                if days and not within_days(n, days):
-                    continue
-                x = n.copy(); x["company"] = top
-                items.append(x)
+        items = build_largecap_section(days=days)
     elif s == "MIDCAP":
         items = build_sector_section(["midcap"], days=days)
     elif s == "SMALLCAP":
@@ -550,7 +604,6 @@ async def get_status():
 async def ping():
     return {"status": "alive", "time": time.time()}
 
-# Root path to avoid 404 when someone hits /
 @app.get("/")
 async def root():
     html = "<html><body><h2>Stock News Backend</h2><p>API available at <code>/api/</code></p></body></html>"
@@ -570,7 +623,6 @@ async def startup_event():
     logger.info("Server starting: loading companies and cache...")
     load_company_names()
     load_cache_from_file()
-    # kick off background jobs
     asyncio.create_task(background_news_updater())
     asyncio.create_task(save_cache_periodically())
     logger.info("Startup complete")
