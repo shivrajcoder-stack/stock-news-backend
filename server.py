@@ -9,7 +9,7 @@ import re
 import feedparser
 import PyPDF2
 
-from fastapi import FastAPI, APIRouter, Query, Response
+from fastapi import FastAPI, APIRouter, Query, Response, HTTPException
 from starlette.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 from pathlib import Path
@@ -17,10 +17,9 @@ from urllib.parse import quote
 from typing import Dict, List, Optional
 from email.utils import parsedate_to_datetime
 from datetime import datetime, timezone
-
-# Google Sheets imports
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
@@ -39,10 +38,15 @@ logger = logging.getLogger(__name__)
 # -----------------------------
 CACHE_FILE = ROOT_DIR / "news_cache.json"
 COMPANY_PDF = ROOT_DIR / "company_list.pdf"
-CACHE_DURATION = 90 * 60  # 1.5 hours (changed from 15 minutes)
+CACHE_DURATION = 90 * 60  # 1.5 hours
 BATCH_SIZE = 100
 SEMAPHORE_LIMIT = 10
 SAVE_INTERVAL_SECONDS = 60
+SHEET_CHUNK_SIZE = 5000  # rows per chunk when writing to Google Sheets
+
+# Google Sheets config (from env)
+SHEET_ID = os.getenv("GOOGLE_SHEET_ID")  # spreadsheet id
+SHEET_TAB_NAME = os.getenv("GOOGLE_SHEET_TAB", "Sheet1")  # tab name; default Sheet1
 
 # -----------------------------
 # Global State
@@ -117,7 +121,6 @@ def clean_html(text: Optional[str]) -> str:
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
-
 def detect_sentiment(text: str) -> str:
     if not text:
         return "neutral"
@@ -130,7 +133,6 @@ def detect_sentiment(text: str) -> str:
             return "bad"
     return "neutral"
 
-
 def remove_duplicates(news_list: List[Dict]) -> List[Dict]:
     seen = set()
     out = []
@@ -141,7 +143,6 @@ def remove_duplicates(news_list: List[Dict]) -> List[Dict]:
         seen.add(key)
         out.append(n)
     return out
-
 
 def parse_date(value: str) -> Optional[datetime]:
     if not value:
@@ -157,7 +158,6 @@ def parse_date(value: str) -> Optional[datetime]:
         except:
             return None
 
-
 def normalize_news_cache():
     for company, data in list(NEWS_CACHE.items()):
         ts = data.get("timestamp")
@@ -172,8 +172,10 @@ def normalize_news_cache():
 # -----------------------------
 # Google Sheets Integration
 # -----------------------------
-SHEET_ID = os.getenv("GOOGLE_SHEET_ID")  # must be set in env
-SHEET_RANGE = "Sheet1!A2"  # start writing after header row
+def get_quoted_tab(tab_name: str) -> str:
+    # Surround with single quotes and escape internal single quotes
+    safe = tab_name.replace("'", "''")
+    return f"'{safe}'"
 
 def get_sheets_service():
     creds_json = os.getenv("GOOGLE_SHEETS_CREDENTIALS_JSON")
@@ -191,23 +193,56 @@ def get_sheets_service():
         logger.error(f"Failed to create Google Sheets service: {e}")
         return None
 
-
-def clear_sheet():
-    service = get_sheets_service()
+def clear_sheet(service):
     if not service or not SHEET_ID:
         logger.warning("Skipping clear_sheet: service or SHEET_ID missing.")
         return
+    tab = get_quoted_tab(SHEET_TAB_NAME)
+    # Use open-ended range for clearing, avoid huge explicit end index
+    range_to_clear = f"{tab}!A2:F"
     try:
         service.spreadsheets().values().clear(
             spreadsheetId=SHEET_ID,
-            range="Sheet1!A2:F200000",
+            range=range_to_clear,
             body={}
         ).execute()
+        logger.info(f"Cleared sheet range: {range_to_clear}")
+    except HttpError as he:
+        logger.error(f"HttpError clearing sheet: {he.status_code} - {getattr(he, 'error_details', he)}")
     except Exception as e:
         logger.error(f"Error clearing sheet: {e}")
 
+def write_rows_chunk(service, rows, start_row=2):
+    """
+    Write a list of rows starting at start_row (1-based). Uses update with A2 start range.
+    We call this for a chunk that will be placed at the appropriate offset.
+    """
+    if not service or not SHEET_ID or not rows:
+        return
+    tab = get_quoted_tab(SHEET_TAB_NAME)
+    # We always update starting at A{start_row}; the API will write as many columns as provided.
+    range_to_write = f"{tab}!A{start_row}"
+    body = {"values": rows, "majorDimension": "ROWS"}
+    try:
+        resp = service.spreadsheets().values().update(
+            spreadsheetId=SHEET_ID,
+            range=range_to_write,
+            valueInputOption="RAW",
+            body=body
+        ).execute()
+        logger.info(f"Wrote chunk to {range_to_write} rows={len(rows)}; updatedCells={resp.get('updatedCells')}")
+    except HttpError as he:
+        logger.error(f"HttpError writing chunk to sheet: {he.status_code} - {getattr(he, 'error_details', he)}")
+        raise
+    except Exception as e:
+        logger.error(f"Error writing chunk to sheet: {e}")
+        raise
 
 def write_news_to_sheet(all_news_rows):
+    """
+    Writes flattened rows to Google Sheet. Splits into chunks to avoid too-large single requests.
+    Clears the sheet first then writes in-place from A2 onwards.
+    """
     service = get_sheets_service()
     if not service or not SHEET_ID:
         logger.warning("Skipping write_news_to_sheet: service or SHEET_ID missing.")
@@ -215,14 +250,24 @@ def write_news_to_sheet(all_news_rows):
     if not all_news_rows:
         logger.info("No rows to write to Google Sheet.")
         return
+
     try:
-        body = {"values": all_news_rows}
-        service.spreadsheets().values().update(
-            spreadsheetId=SHEET_ID,
-            range=SHEET_RANGE,
-            valueInputOption="RAW",
-            body=body
-        ).execute()
+        # Clear existing data first
+        clear_sheet(service)
+
+        # Write in chunks.
+        total = len(all_news_rows)
+        logger.info(f"Writing {total} rows to Google Sheet in chunks of {SHEET_CHUNK_SIZE}...")
+
+        written = 0
+        # start_row is 2 (header row is row 1)
+        start_row = 2
+        while written < total:
+            chunk = all_news_rows[written:written + SHEET_CHUNK_SIZE]
+            write_rows_chunk(service, chunk, start_row=start_row + written)
+            written += len(chunk)
+
+        logger.info("Finished writing all chunks to Google Sheet.")
     except Exception as e:
         logger.error(f"Error writing to sheet: {e}")
 
@@ -248,10 +293,7 @@ def flatten_all_news():
 # -----------------------------
 def load_company_names():
     global COMPANY_NAMES
-    # Primary: configured COMPANY_PDF (company_list.pdf in project root)
-    # Fallback: uploaded combined_companies.pdf (path provided)
     fallback_path = Path("/mnt/data/combined_companies.pdf")
-
     pdf_path = COMPANY_PDF if COMPANY_PDF.exists() else (fallback_path if fallback_path.exists() else None)
 
     if pdf_path is None:
@@ -265,7 +307,6 @@ def load_company_names():
         companies = []
         for line in text.split("\n"):
             line = line.strip()
-            # Heuristic: lines that look like company names
             if line and ("Limited" in line or "Ltd" in line or "ETF" in line or "Corporation" in line or "Industries" in line):
                 companies.append(line)
         # dedupe preserving order
@@ -289,7 +330,6 @@ def load_cache_from_file():
         except Exception as e:
             logger.error(f"Failed to load cache file: {e}")
 
-
 async def save_cache_periodically():
     while True:
         try:
@@ -305,14 +345,9 @@ async def save_cache_periodically():
 # RSS fetching (cache-first rule-based)
 # -----------------------------
 async def fetch_company_news(company_name: str) -> List[Dict]:
-    """
-    Query news.google.com RSS for "<company_name> stock"
-    Returns up to 5 cleaned items with title, description, link, pubDate, raw_text
-    """
     try:
         query = f"{company_name} stock"
         url = f"https://news.google.com/rss/search?q={quote(query)}"
-        # feedparser is sync; run in thread to avoid blocking event loop
         feed = await asyncio.to_thread(feedparser.parse, url)
         news_items = []
         for entry in feed.entries[:8]:
@@ -329,7 +364,6 @@ async def fetch_company_news(company_name: str) -> List[Dict]:
                 "raw_text": text_combined
             })
         news_items = remove_duplicates(news_items)
-        # normalize pubDate to iso if possible
         for n in news_items:
             p = n.get("pubDate", "")
             parsed = parse_date(p)
@@ -349,12 +383,11 @@ async def update_one_company(company: str):
         for n in news:
             txt = (n.get("title", "") + " " + n.get("description", "")).strip()
             n["sentiment"] = detect_sentiment(txt)
-            n["mentioned_companies"] = []  # placeholder, can be populated later
+            n["mentioned_companies"] = []
         timestamp = time.time()
         if news:
             NEWS_CACHE[company] = {"news": news, "timestamp": timestamp}
         elif company not in NEWS_CACHE:
-            # ensure company exists in cache even with empty list to avoid missing keys
             NEWS_CACHE[company] = {"news": [], "timestamp": timestamp}
     except Exception as e:
         logger.error(f"update_one_company error for {company}: {e}")
@@ -364,11 +397,9 @@ async def update_one_company(company: str):
 # -----------------------------
 async def update_batch(companies: List[str]):
     sem = asyncio.Semaphore(SEMAPHORE_LIMIT)
-
     async def worker(c):
         async with sem:
             await update_one_company(c)
-
     await asyncio.gather(*[worker(c) for c in companies], return_exceptions=True)
 
 # -----------------------------
@@ -390,24 +421,16 @@ async def background_news_updater():
                     f"Updater: processing batch {i // BATCH_SIZE + 1} / {(total + BATCH_SIZE - 1) // BATCH_SIZE} ({len(batch)} companies)"
                 )
                 await update_batch(batch)
-                # tiny random sleep to avoid hammering remote
                 await asyncio.sleep(random.uniform(0.5, 1.5))
 
             logger.info(f"Background update cycle finished. Cached companies: {len(NEWS_CACHE)}")
 
-            # -----------------------------
             # Push flattened news to Google Sheet
-            # -----------------------------
             try:
                 logger.info("Flattening news for Google Sheet...")
                 rows = flatten_all_news()
-
-                logger.info("Clearing old rows in Google Sheet...")
-                clear_sheet()
-
-                logger.info(f"Writing {len(rows)} rows to Google Sheet...")
+                logger.info("Writing rows to Google Sheet...")
                 write_news_to_sheet(rows)
-
                 logger.info("Google Sheet updated successfully!")
             except Exception as e:
                 logger.error(f"Failed to update Google Sheet: {e}")
@@ -418,12 +441,11 @@ async def background_news_updater():
             await asyncio.sleep(60)
 
 # -----------------------------
-# Helpers for filtering/sorting
+# Helpers for filtering/sorting (same as before)
 # -----------------------------
 def is_high_impact(text: str) -> bool:
     t = (text or "").lower()
     return any(k in t for k in IMPACT_KEYWORDS)
-
 
 def within_days(item: Dict, days: int) -> bool:
     if not days:
@@ -433,17 +455,13 @@ def within_days(item: Dict, days: int) -> bool:
         return False
     dt = parse_date(pub)
     if not dt:
-        # treat unknown parse as valid recent
         return True
     now = datetime.now(timezone.utc)
     delta = now - dt
     return delta.days <= days
 
-# -----------------------------
-# Builders for API sections
-# -----------------------------
+# (Builders functions — unchanged logic from your version)
 def build_index_section(limit=50, days: Optional[int] = None):
-    """Collect index-related items (nifty / sensex / banknifty keywords)"""
     results = []
     added = set()
     for company, cache in NEWS_CACHE.items():
@@ -466,9 +484,7 @@ def build_index_section(limit=50, days: Optional[int] = None):
         pass
     return results[:limit]
 
-
 def build_largecap_section(limit=60, days: Optional[int] = None):
-    """Collect news for TOP_STOCKS (large / famous stocks)."""
     items = []
     for top in TOP_STOCKS:
         for n in NEWS_CACHE.get(top, {}).get("news", []):
@@ -487,9 +503,7 @@ def build_largecap_section(limit=60, days: Optional[int] = None):
         pass
     return items[:limit]
 
-
 def build_general_section(limit=150, days: Optional[int] = None):
-    """General market news (fallback — returns recent items across cache)."""
     all_items = []
     for company, cache in NEWS_CACHE.items():
         for n in cache.get("news", []):
@@ -505,17 +519,11 @@ def build_general_section(limit=150, days: Optional[int] = None):
         pass
     return all_items[:limit]
 
-
 def build_all_section(limit=150, days: Optional[int] = None, only_impact=False):
-    """
-    ALL section: index/news first, then TOP_STOCKS, then other impactful companies.
-    If days is provided (int), only include items within that many days.
-    If only_impact is True, prefer/only include high-impact items.
-    """
     results = []
     added = set()
 
-    # 1) index-like news first
+    # index-like news first
     for company, cache in NEWS_CACHE.items():
         for n in cache.get("news", []):
             txt = (n.get("title", "") + " " + n.get("description", "")).lower()
@@ -528,11 +536,10 @@ def build_all_section(limit=150, days: Optional[int] = None, only_impact=False):
                 added.add(company)
                 break
 
-    # 2) top stocks (prefer high impact)
+    # top stocks next
     for top in TOP_STOCKS:
         if top in NEWS_CACHE and top not in added:
             candidates = NEWS_CACHE[top].get("news", [])
-            # sort: high impact first then recent
             candidates = sorted(
                 candidates,
                 key=lambda it: (not is_high_impact(it.get("title", "") + " " + it.get("description", "")), it.get("pubDate", "")),
@@ -550,7 +557,7 @@ def build_all_section(limit=150, days: Optional[int] = None, only_impact=False):
                 added.add(top)
                 break
 
-    # 3) impactful others
+    # impactful others
     for company, cache in NEWS_CACHE.items():
         if company in added:
             continue
@@ -568,7 +575,7 @@ def build_all_section(limit=150, days: Optional[int] = None, only_impact=False):
         if len(results) >= limit:
             break
 
-    # 4) fill with recent / diverse if needed
+    # fill with recent / diverse if needed
     if len(results) < limit:
         for company, cache in NEWS_CACHE.items():
             if company in added:
@@ -593,7 +600,6 @@ def build_all_section(limit=150, days: Optional[int] = None, only_impact=False):
         pass
     return results[:limit]
 
-
 def build_results_section(limit=150, days: Optional[int] = None):
     results = []
     for company, cache in NEWS_CACHE.items():
@@ -614,7 +620,6 @@ def build_results_section(limit=150, days: Optional[int] = None):
         pass
     return remove_duplicates(results)[:limit]
 
-
 def build_sector_section(keywords: List[str], limit=150, days: Optional[int] = None):
     items = []
     keys = [k.lower() for k in keywords]
@@ -633,7 +638,6 @@ def build_sector_section(keywords: List[str], limit=150, days: Optional[int] = N
     except Exception:
         pass
     return items[:limit]
-
 
 def build_penny_section(limit=150, days: Optional[int] = None):
     items = []
@@ -664,7 +668,6 @@ async def search_companies(q: str = Query("", description="Search query")):
         matches = [name for name in COMPANY_NAMES if ql in name.lower()]
     return matches[:50]
 
-
 @api_router.get("/news/company/{company_name}")
 async def get_company_news(company_name: str):
     news = NEWS_CACHE.get(company_name, {}).get("news", [])
@@ -673,7 +676,6 @@ async def get_company_news(company_name: str):
             n["sentiment"] = detect_sentiment(n.get("title", "") + " " + n.get("description", ""))
     return {"company": company_name, "news": news}
 
-
 @api_router.get("/news/all")
 async def get_all_news(
     days: Optional[int] = Query(None, description="Optional filter: last N days"),
@@ -681,12 +683,6 @@ async def get_all_news(
     include_indexes: Optional[bool] = Query(False, description="If true, return grouped sections (indexes/largecap/general)"),
     same_day: Optional[bool] = Query(False, description="If true, prefer same-day (today) news; fallback to yesterday if none")
 ):
-    """
-    Standard flat list (backwards compatible)
-    If same_day=True -> try to return only today's news (days=0). If no index items today, include largecap/midcap today.
-    If nothing found for today, fallback to yesterday (days=1).
-    """
-    # Normal path when same_day is not requested
     if not same_day:
         items = build_all_section(limit=150, days=days, only_impact=only_impact)
         for n in items:
@@ -710,10 +706,7 @@ async def get_all_news(
             }
         return {"news": items, "count": len(items)}
 
-    # -----------------------------
-    # same_day=True path
-    # -----------------------------
-    # Try today (days=0)
+    # same_day=True logic (unchanged)
     today_days = 0
     yesterday_days = 1
 
@@ -721,18 +714,14 @@ async def get_all_news(
     largecap = build_largecap_section(limit=60, days=today_days)
     general = build_general_section(limit=150, days=today_days)
 
-    # If no index-style items today, attempt to include largecap/midcap today (per your request)
     if not indexes:
-        # If we don't have index news today, still include largecap/midcap/general today if present
         combined_today = remove_duplicates((largecap or []) + (general or []))
         if combined_today:
-            # build flat items (or grouped if client asked)
             flat_today = combined_today[:150]
             for n in flat_today:
                 if "sentiment" not in n:
                     n["sentiment"] = detect_sentiment(n.get("title", "") + " " + n.get("description", ""))
             if include_indexes:
-                # return grouped but indexes empty
                 return {
                     "sections": {
                         "indexes": [],
@@ -743,7 +732,6 @@ async def get_all_news(
                 }
             return {"news": flat_today, "count": len(flat_today)}
 
-    # If indexes exist today (good), return sections today
     if indexes:
         if include_indexes:
             for arr in (indexes, largecap, general):
@@ -758,19 +746,16 @@ async def get_all_news(
                 },
                 "count": len(indexes) + len(largecap) + len(general)
             }
-        # flatten in index-first order
         flat = remove_duplicates(indexes + largecap + general)[:150]
         for n in flat:
             if "sentiment" not in n:
                 n["sentiment"] = detect_sentiment(n.get("title", "") + " " + n.get("description", ""))
         return {"news": flat, "count": len(flat)}
 
-    # If reached here there was nothing for today. Fallback to yesterday (days=1)
     indexes_y = build_index_section(limit=60, days=yesterday_days)
     largecap_y = build_largecap_section(limit=60, days=yesterday_days)
     general_y = build_general_section(limit=150, days=yesterday_days)
 
-    # If still nothing, finally fall back to standard build_all_section without day filter
     if not (indexes_y or largecap_y or general_y):
         fallback_items = build_all_section(limit=150, days=None, only_impact=only_impact)
         for n in fallback_items:
@@ -787,7 +772,6 @@ async def get_all_news(
             return {"sections": {"indexes": idx, "largecap": lc, "general": gen}, "count": len(idx) + len(lc) + len(gen)}
         return {"news": fallback_items, "count": len(fallback_items)}
 
-    # Return yesterday's content
     if include_indexes:
         for arr in (indexes_y, largecap_y, general_y):
             for n in arr:
@@ -809,11 +793,9 @@ async def get_results_news(days: Optional[int] = Query(None)):
             n["sentiment"] = detect_sentiment(n.get("title", "") + " " + n.get("description", ""))
     return {"news": items, "count": len(items)}
 
-
 @api_router.get("/news/sector/{sector_name}")
 async def get_sector_news(sector_name: str, days: Optional[int] = Query(None)):
     s = sector_name.upper()
-
     if s == "PENNY":
         items = build_penny_section(days=days)
     elif s == "LARGECAP" or s == "LARGE CAP":
@@ -825,37 +807,110 @@ async def get_sector_news(sector_name: str, days: Optional[int] = Query(None)):
     else:
         keywords = SECTOR_KEYWORDS.get(s, [sector_name])
         items = build_sector_section(keywords, days=days)
-
     for n in items:
         if "sentiment" not in n:
             n["sentiment"] = detect_sentiment(n.get("title", "") + " " + n.get("description", ""))
-
     return {"news": items, "count": len(items)}
-
 
 @api_router.get("/status")
 async def get_status():
     return {
         "companies_loaded": len(COMPANY_NAMES),
         "companies_cached": len(NEWS_CACHE),
-        "cache_duration_minutes": CACHE_DURATION / 60
+        "cache_duration_minutes": CACHE_DURATION / 60,
+        "sheet_id": bool(SHEET_ID),
+        "sheet_tab": SHEET_TAB_NAME
     }
-
 
 @api_router.get("/ping")
 async def ping():
     return {"status": "alive", "time": time.time()}
-
 
 @app.get("/")
 async def root():
     html = "<html><body><h2>Stock News Backend</h2><p>API available at <code>/api/</code></p></body></html>"
     return Response(content=html, media_type="text/html")
 
+# -----------------------------
+# Debug endpoints (manual testing)
+# -----------------------------
+@api_router.get("/debug/push_sheet_test")
+async def debug_push_sheet_test():
+    """
+    Write the first non-empty cached company->news row to the Google Sheet.
+    Useful to validate sheet credentials and permissions quickly.
+    """
+    try:
+        # find first company with at least one news item
+        for company, data in NEWS_CACHE.items():
+            items = data.get("news", [])
+            if items:
+                n = items[0]
+                row = [[company,
+                        n.get("title", ""),
+                        n.get("description", ""),
+                        n.get("link", ""),
+                        n.get("pubDate", ""),
+                        n.get("sentiment", detect_sentiment(n.get("title", "") + " " + n.get("description", "")))]]
+                service = get_sheets_service()
+                if not service or not SHEET_ID:
+                    raise HTTPException(status_code=500, detail="Sheets service or SHEET_ID not configured.")
+                # clear first 10 rows to keep test area tidy
+                try:
+                    clear_sheet(service)
+                except Exception:
+                    pass
+                try:
+                    write_rows_chunk(service, row, start_row=2)
+                    return {"status": "ok", "written_rows": 1, "company": company}
+                except Exception as e:
+                    logger.error(f"Test write failed: {e}")
+                    raise HTTPException(status_code=500, detail=f"Test write failed: {e}")
+        return {"status": "no_data", "message": "No cached company with news found yet."}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"debug push error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-# -----------------------------
-# App wiring
-# -----------------------------
+@api_router.get("/debug/run_once")
+async def debug_run_once(limit: Optional[int] = Query(10, description="Number of companies to update (first N companies)")):
+    """
+    Run a single update cycle for first `limit` companies (fast test).
+    After fetching, it will write flattened rows to the sheet.
+    """
+    try:
+        if not COMPANY_NAMES:
+            raise HTTPException(status_code=400, detail="No companies loaded.")
+        to_process = COMPANY_NAMES[:max(1, int(limit))]
+        await update_batch(to_process)
+        # write to sheet only the newly fetched items (not the entire cache)
+        rows = []
+        for c in to_process:
+            for item in NEWS_CACHE.get(c, {}).get("news", []):
+                rows.append([c, item.get("title", ""), item.get("description", ""), item.get("link", ""), item.get("pubDate", ""), item.get("sentiment", "")])
+        write_news_to_sheet(rows)
+        return {"status": "ok", "processed_companies": len(to_process), "written_rows": len(rows)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"debug run_once error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@api_router.get("/debug/write_all")
+async def debug_write_all():
+    """
+    Manually trigger clearing & writing of the entire flattened NEWS_CACHE to Google Sheet.
+    Use carefully for big caches.
+    """
+    try:
+        rows = flatten_all_news()
+        write_news_to_sheet(rows)
+        return {"status": "ok", "total_rows": len(rows)}
+    except Exception as e:
+        logger.error(f"debug write_all error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
 app.include_router(api_router)
 app.add_middleware(
     CORSMiddleware,
@@ -863,7 +918,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"]
 )
-
 
 # -----------------------------
 # Startup & Shutdown Events
@@ -876,7 +930,6 @@ async def startup_event():
     asyncio.create_task(background_news_updater())
     asyncio.create_task(save_cache_periodically())
     logger.info("Startup complete")
-
 
 @app.on_event("shutdown")
 async def shutdown_event():
