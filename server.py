@@ -18,6 +18,10 @@ from typing import Dict, List, Optional
 from email.utils import parsedate_to_datetime
 from datetime import datetime, timezone
 
+# Google Sheets imports
+from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
+
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / ".env")
 
@@ -35,7 +39,7 @@ logger = logging.getLogger(__name__)
 # -----------------------------
 CACHE_FILE = ROOT_DIR / "news_cache.json"
 COMPANY_PDF = ROOT_DIR / "company_list.pdf"
-CACHE_DURATION = 15 * 60
+CACHE_DURATION = 90 * 60  # 1.5 hours (changed from 15 minutes)
 BATCH_SIZE = 100
 SEMAPHORE_LIMIT = 10
 SAVE_INTERVAL_SECONDS = 60
@@ -166,6 +170,80 @@ def normalize_news_cache():
             item["pubDate"] = parsed.isoformat() if parsed else (pub or "")
 
 # -----------------------------
+# Google Sheets Integration
+# -----------------------------
+SHEET_ID = os.getenv("GOOGLE_SHEET_ID")  # must be set in env
+SHEET_RANGE = "Sheet1!A2"  # start writing after header row
+
+def get_sheets_service():
+    creds_json = os.getenv("GOOGLE_SHEETS_CREDENTIALS_JSON")
+    if not creds_json:
+        logger.error("Google Sheets credentials JSON missing (GOOGLE_SHEETS_CREDENTIALS_JSON).")
+        return None
+    try:
+        creds_dict = json.loads(creds_json)
+        credentials = Credentials.from_service_account_info(
+            creds_dict,
+            scopes=["https://www.googleapis.com/auth/spreadsheets"]
+        )
+        return build("sheets", "v4", credentials=credentials)
+    except Exception as e:
+        logger.error(f"Failed to create Google Sheets service: {e}")
+        return None
+
+
+def clear_sheet():
+    service = get_sheets_service()
+    if not service or not SHEET_ID:
+        logger.warning("Skipping clear_sheet: service or SHEET_ID missing.")
+        return
+    try:
+        service.spreadsheets().values().clear(
+            spreadsheetId=SHEET_ID,
+            range="Sheet1!A2:F200000",
+            body={}
+        ).execute()
+    except Exception as e:
+        logger.error(f"Error clearing sheet: {e}")
+
+
+def write_news_to_sheet(all_news_rows):
+    service = get_sheets_service()
+    if not service or not SHEET_ID:
+        logger.warning("Skipping write_news_to_sheet: service or SHEET_ID missing.")
+        return
+    if not all_news_rows:
+        logger.info("No rows to write to Google Sheet.")
+        return
+    try:
+        body = {"values": all_news_rows}
+        service.spreadsheets().values().update(
+            spreadsheetId=SHEET_ID,
+            range=SHEET_RANGE,
+            valueInputOption="RAW",
+            body=body
+        ).execute()
+    except Exception as e:
+        logger.error(f"Error writing to sheet: {e}")
+
+# -----------------------------
+# Helpers to flatten NEWS_CACHE for sheet
+# -----------------------------
+def flatten_all_news():
+    rows = []
+    for company, data in NEWS_CACHE.items():
+        for item in data.get("news", []):
+            rows.append([
+                company,
+                item.get("title", ""),
+                item.get("description", ""),
+                item.get("link", ""),
+                item.get("pubDate", ""),
+                item.get("sentiment", "")
+            ])
+    return rows
+
+# -----------------------------
 # Load companies from PDF
 # -----------------------------
 def load_company_names():
@@ -262,7 +340,6 @@ async def fetch_company_news(company_name: str) -> List[Dict]:
         logger.error(f"fetch error for {company_name}: {e}")
         return []
 
-
 # -----------------------------
 # Update single company
 # -----------------------------
@@ -282,7 +359,6 @@ async def update_one_company(company: str):
     except Exception as e:
         logger.error(f"update_one_company error for {company}: {e}")
 
-
 # -----------------------------
 # Concurrency batch
 # -----------------------------
@@ -294,7 +370,6 @@ async def update_batch(companies: List[str]):
             await update_one_company(c)
 
     await asyncio.gather(*[worker(c) for c in companies], return_exceptions=True)
-
 
 # -----------------------------
 # Background updater
@@ -319,11 +394,28 @@ async def background_news_updater():
                 await asyncio.sleep(random.uniform(0.5, 1.5))
 
             logger.info(f"Background update cycle finished. Cached companies: {len(NEWS_CACHE)}")
+
+            # -----------------------------
+            # Push flattened news to Google Sheet
+            # -----------------------------
+            try:
+                logger.info("Flattening news for Google Sheet...")
+                rows = flatten_all_news()
+
+                logger.info("Clearing old rows in Google Sheet...")
+                clear_sheet()
+
+                logger.info(f"Writing {len(rows)} rows to Google Sheet...")
+                write_news_to_sheet(rows)
+
+                logger.info("Google Sheet updated successfully!")
+            except Exception as e:
+                logger.error(f"Failed to update Google Sheet: {e}")
+
             await asyncio.sleep(CACHE_DURATION)
         except Exception as e:
             logger.error(f"Background updater crashed: {e}")
             await asyncio.sleep(60)
-
 
 # -----------------------------
 # Helpers for filtering/sorting
@@ -346,7 +438,6 @@ def within_days(item: Dict, days: int) -> bool:
     now = datetime.now(timezone.utc)
     delta = now - dt
     return delta.days <= days
-
 
 # -----------------------------
 # Builders for API sections
@@ -559,6 +650,7 @@ def build_penny_section(limit=150, days: Optional[int] = None):
     except Exception:
         pass
     return items[:limit]
+
 # -----------------------------
 # API endpoints
 # -----------------------------
@@ -708,7 +800,6 @@ async def get_all_news(
         if "sentiment" not in n:
             n["sentiment"] = detect_sentiment(n.get("title", "") + " " + n.get("description", ""))
     return {"news": flat_y, "count": len(flat_y)}
-
 
 @api_router.get("/news/results")
 async def get_results_news(days: Optional[int] = Query(None)):
