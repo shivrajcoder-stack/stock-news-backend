@@ -585,7 +585,7 @@ async def background_news_updater():
                     logger.error(f"Failed to write All/Sector rows: {e}")
 
             # Immediately start next cycle (no long sleep). small 1s pause to avoid busy-loop
-            await asyncio.sleep(1)
+            await asyncio.sleep(60*60)
         except Exception as e:
             logger.error(f"Background updater crashed: {e}")
             await asyncio.sleep(5)
